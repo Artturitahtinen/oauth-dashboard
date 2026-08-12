@@ -1,3 +1,5 @@
+using OAuthDashboard.Infrastructure.Auth;
+
 var builder = WebApplication.CreateBuilder(args);
 
 // Add services to the container.
@@ -5,6 +7,13 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddControllers();
 // Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
 builder.Services.AddOpenApi();
+
+builder.Services.AddMemoryCache();
+builder.Services.AddSingleton<OAuthStateStore>();
+builder.Services.AddOptions<GitHubOAuthOptions>()
+    .Bind(builder.Configuration.GetSection("OAuth:GitHub"))
+    .ValidateOnStart();
+builder.Services.AddHttpClient<GitHubOAuthClient>();
 
 // The SPA runs on its own origin, so every call it makes here is cross-origin. Because those
 // calls carry the BFF session cookie, the policy has to name the origin explicitly —

@@ -19,7 +19,7 @@ tests/OAuthDashboard.Tests/
 
 - [x] M0 — Solution scaffolded (Api / Core / Infrastructure / Tests projects wired together)
 - [x] M0 — Register GitHub OAuth App + Google Cloud OAuth client, confirm CORS-connected hello world
-- [ ] M1 — GitHub, hand-rolled, no persistence
+- [x] M1 — GitHub, hand-rolled, no persistence
 - [ ] M2 — PKCE + encrypted persistence + local login
 - [ ] M3 — Refresh token flow
 - [ ] M4 — Google + OIDC
@@ -58,8 +58,34 @@ consent screen stays in Testing mode with the developer's own account as a test 
   accepted together with `Secure`. `/api/health` demonstrates this with a throwaway probe cookie.
 - Client secrets stay in user-secrets, outside the repo and outside the SPA bundle.
 
-Still to come: PKCE, state parameter, nonce, redirect URI allowlisting, revocation,
-least-privilege scopes.
+### M1 — the authorization code flow, hand-rolled
+
+- **`state` is single-use.** `/authorize` mints a random 256-bit value and stores it server-side
+  (`OAuthStateStore`, an `IMemoryCache` entry with a 5-minute TTL); `/callback` removes it the
+  moment it's checked. A captured callback URL replayed a second time fails with `invalid_state`
+  because there's nothing left to consume — this is the CSRF protection on the link action, not
+  an incidental detail.
+- **The redirect URI is never taken from the request.** GitHub is configured (via user-secrets)
+  with the exact callback URL this backend will send, and that same value is the only one this
+  backend ever sends back to GitHub during the token exchange. There's no code path where a
+  caller-supplied redirect target could substitute in.
+- **The token exchange happens over a direct server-to-server `HttpClient` POST** to GitHub's
+  token endpoint — the SPA never sees the authorization `code`, let alone the access token,
+  because the entire redirect chain (`/authorize` → github.com → `/callback`) never touches the
+  SPA's origin.
+- **Tokens don't go in logs, even in a milestone that says "nothing hidden."** M1 logs that a
+  token was obtained (scope, type, length) but deliberately not the token value — the plan's
+  literal suggestion to log the token was worth deviating from, since a logging habit picked up
+  now would otherwise need to be unlearned right before M2 adds real persistence.
+- Scope requested is the minimum needed to prove the flow (`read:user`) — broader scopes get
+  added only when a specific widget needs them (M5).
+
+Verified by walking the real browser redirect end to end: `/authorize` → GitHub's consent screen
+→ `/callback`, which returns the caller's own GitHub profile JSON. Confirmed both the happy path
+and that state validation fails closed on a missing state, an unrecognized state, and a
+provider-side denial (`error=access_denied`).
+
+Still to come: PKCE, persistence, nonce, revocation, least-privilege scope expansion per widget.
 
 ## Running locally
 
