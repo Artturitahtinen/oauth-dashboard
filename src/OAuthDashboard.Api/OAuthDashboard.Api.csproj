@@ -1,0 +1,20 @@
+﻿<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UserSecretsId>ee447416-6879-41ff-b394-7b9c9e3da275</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.3" />
+    <PackageReference Include="Microsoft.OpenApi" Version="2.9.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\OAuthDashboard.Infrastructure\OAuthDashboard.Infrastructure.csproj" />
+    <ProjectReference Include="..\OAuthDashboard.Core\OAuthDashboard.Core.csproj" />
+  </ItemGroup>
+
+</Project>

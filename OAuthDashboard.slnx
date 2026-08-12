@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/OAuthDashboard.Api/OAuthDashboard.Api.csproj" />
+    <Project Path="src/OAuthDashboard.Core/OAuthDashboard.Core.csproj" />
+    <Project Path="src/OAuthDashboard.Infrastructure/OAuthDashboard.Infrastructure.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/OAuthDashboard.Tests/OAuthDashboard.Tests.csproj" />
+  </Folder>
+</Solution>
