@@ -480,3 +480,8 @@ $RECYCLE.BIN/
 
 # Vim temporary swap files
 *.swp
+
+# Local SQLite database (holds encrypted provider tokens - never commit)
+*.db
+*.db-shm
+*.db-wal

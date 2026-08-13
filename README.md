@@ -20,7 +20,7 @@ tests/OAuthDashboard.Tests/
 - [x] M0 — Solution scaffolded (Api / Core / Infrastructure / Tests projects wired together)
 - [x] M0 — Register GitHub OAuth App + Google Cloud OAuth client, confirm CORS-connected hello world
 - [x] M1 — GitHub, hand-rolled, no persistence
-- [ ] M2 — PKCE + encrypted persistence + local login
+- [x] M2 — PKCE + encrypted persistence + local login
 - [ ] M3 — Refresh token flow
 - [ ] M4 — Google + OIDC
 - [ ] M5 — Unified dashboard
@@ -85,7 +85,93 @@ Verified by walking the real browser redirect end to end: `/authorize` → GitHu
 and that state validation fails closed on a missing state, an unrecognized state, and a
 provider-side denial (`error=access_denied`).
 
-Still to come: PKCE, persistence, nonce, revocation, least-privilege scope expansion per widget.
+### M2 — PKCE, encrypted persistence, and a local identity
+
+**PKCE (S256).** `/authorize` mints a `code_verifier` alongside the state and sends only
+`code_challenge=BASE64URL(SHA256(ASCII(verifier)))` plus `code_challenge_method=S256`. The verifier
+stays in `OAuthStateStore` until the server-to-server token POST, so the value that would let a
+stolen code be redeemed never appears in the address bar, browser history, or GitHub's logs.
+
+This backend is a *confidential* client — it holds a `client_secret`, so an intercepted code is
+already unusable without it and PKCE is not strictly required. It's implemented anyway because it
+costs almost nothing, because OAuth 2.1 makes it mandatory for all client types, and because "we
+have a secret" stops being true the moment any part of this runs somewhere a secret can't be kept.
+`plain` is the other method the RFC allows and is pointless: it sends the verifier *as* the
+challenge, so anyone who can read the authorize URL gets both halves.
+
+The one implementation detail worth pinning down: S256 hashes the **ASCII characters of the verifier
+string**, not the random bytes it was decoded from. Getting that wrong still yields a plausible
+43-character challenge and fails only later, as an opaque `invalid_grant` from the provider — so
+`PkceTests` asserts the published RFC 7636 Appendix B vector rather than just checking the shape.
+
+**State now carries who started the flow.** `OAuthStateStore` went from storing a bare marker to a
+`PendingAuthorization` record, because two things have to survive the round trip and neither can
+safely live in the browser: the PKCE verifier, and the id of the user who initiated. Binding the
+user id means the callback can assert the flow is being *finished by the same session that started
+it* — otherwise a link begun in one session could be completed in another, attaching an attacker's
+GitHub account to this user's dashboard (or this user's account to an attacker's session). State
+being single-use stops replay; state being *bound* stops cross-session grafting. They're different
+attacks and need different checks.
+
+**Tokens are encrypted, passwords are hashed, and the difference is deliberate.**
+- Provider tokens go through `TokenProtector` (Data Protection, purpose
+  `OAuthDashboard.ProviderTokens.v1`) — *reversible* encryption, because the whole point is to
+  replay them to GitHub later.
+- The local password goes through `PasswordHasher` (PBKDF2-HMAC-SHA256, 600k iterations, per-user
+  random salt, constant-time compare) — *irreversible*, because nothing ever needs the plaintext
+  back.
+- Data Protection derives a distinct key per purpose string, which is what keeps the token protector
+  and the session cookie's protector from being interchangeable. Sharing a purpose would let a
+  cookie value be fed to the token unprotector.
+- `SetApplicationName("OAuthDashboard")` is not cosmetic: without it the key-derivation
+  discriminator comes from the content-root path, so moving or renaming the folder would silently
+  produce a different key and every token already in SQLite would fail to decrypt.
+
+What this buys and what it doesn't: a copied `oauthdashboard.db` is useless on its own. But in
+development the keyring sits unencrypted under `%LOCALAPPDATA%\ASP.NET\DataProtection-Keys`, so an
+attacker with the whole machine has both halves. This defends against a leaked database file, not
+against a compromised host — a real deployment would put the keyring in a KMS.
+
+**Local login is not OAuth, and keeping them separate matters.** `SessionController` proves *who the
+local user is*; `GitHubAuthController` proves *what that user authorized this app to do at GitHub*.
+Conflating "log in with GitHub" and "link GitHub" is the usual source of confusion, and the BFF
+split makes the distinction concrete — you log into the dashboard, then link providers to it.
+Registration is a first-run claim, open only while the users table is empty, so a personal project
+doesn't ship an open sign-up endpoint or need a bootstrap password sitting in plaintext config.
+
+**Failed logins are indistinguishable.** "No such user" and "wrong password" both return
+`401 invalid_credentials`, and the unknown-user path still runs a full PBKDF2 verification against a
+dummy hash so it takes comparable time. Returning early there would leak the same information
+through latency that the shared error message was hiding. The log line is equally vague — a failed
+attempt is no reason to write an attacker-supplied guess into a log file.
+
+**The callback redirects instead of returning JSON.** A provider callback lands in a top-level
+browser navigation, so its response is a *page the user sees*; it must not be a page containing
+token material. It now 302s to `{Spa:Origin}/connections?linked=github`, with failures becoming
+`?error=<code>`. The target is built from configuration — a caller-supplied `?next=` here would be
+an open redirect hanging off an authenticated endpoint.
+
+**Cookie flags, and why `SameSite=None` is required rather than sloppy.** The session cookie is
+`HttpOnly` (script can't read it, so an XSS bug can't exfiltrate the session), `Secure`, and
+`SameSite=None` — necessary because the SPA (`http://localhost:5173`) and this API
+(`https://localhost:7236`) differ in *scheme* and are therefore cross-site, not merely
+cross-origin. See the M0 note. Cookie auth's default 302-to-login-page is replaced: fetch callers
+get a `401` they can branch on, real browser navigations get redirected into the SPA's login route.
+
+**Unlink is still local-only.** `DELETE /api/connections/{provider}` deletes the row; GitHub still
+considers the grant live. That's called out in the code as an M5 gap rather than left to look
+finished — deleting a local row is not revocation.
+
+Verified: 38 tests green, covering the RFC 7636 vector, single-use and session-bound state,
+PBKDF2 round-trip and malformed-hash handling, and — the assertion that actually proves encryption
+at rest — that the token column read straight out of SQLite does not contain the plaintext.
+End-to-end, against the running API: anonymous `/api/connections` and `/api/auth/github/authorize`
+return `401`; the same authorize URL with `Accept: text/html` redirects to the SPA login; a
+registered session gets a `302` to GitHub carrying `code_challenge` and
+`code_challenge_method=S256`; and a second `/register` returns `409`.
+
+Still to come: refresh flow (M3), nonce and `id_token` validation (M4), real revocation and
+least-privilege scope expansion per widget (M5).
 
 ## Running locally
 
@@ -106,3 +192,16 @@ dotnet run --launch-profile https --project src/OAuthDashboard.Api
 
 `GET https://localhost:7236/api/health` is the connectivity probe. Called twice from the SPA it
 should report `cookieEchoed: true` on the second call.
+
+The SQLite schema is applied on startup (`Database.MigrateAsync()`), so there's no separate
+`dotnet ef database update` step — the app owns its schema, which keeps the M2 verification
+("restart the process; are the tokens still readable?") a one-command exercise. `dotnet-ef` is
+pinned as a repo-local tool for *creating* migrations:
+
+```
+dotnet dotnet-ef migrations add <Name> --project src/OAuthDashboard.Infrastructure --startup-project src/OAuthDashboard.Api --output-dir Persistence/Migrations
+```
+
+On first run the SPA's login screen offers to claim the single local account; after that it asks for
+those credentials. To start over, delete `src/OAuthDashboard.Api/oauthdashboard.db` (gitignored — it
+holds encrypted provider tokens).
