@@ -162,13 +162,37 @@ get a `401` they can branch on, real browser navigations get redirected into the
 considers the grant live. That's called out in the code as an M5 gap rather than left to look
 finished — deleting a local row is not revocation.
 
-Verified: 38 tests green, covering the RFC 7636 vector, single-use and session-bound state,
-PBKDF2 round-trip and malformed-hash handling, and — the assertion that actually proves encryption
-at rest — that the token column read straight out of SQLite does not contain the plaintext.
-End-to-end, against the running API: anonymous `/api/connections` and `/api/auth/github/authorize`
-return `401`; the same authorize URL with `Accept: text/html` redirects to the SPA login; a
-registered session gets a `302` to GitHub carrying `code_challenge` and
-`code_challenge_method=S256`; and a second `/register` returns `409`.
+**`GET /api/connections/{provider}/check` exists because M2's central claim was otherwise
+unfalsifiable.** Every field on the connections response comes from an *unencrypted* column, so a
+completely broken protector would still render a healthy-looking "Linked" card. This endpoint
+decrypts the stored token and spends it on a real GitHub call, reporting only whether it worked. It's
+also the seed of M3 — "use the stored token, notice it was rejected" is the signal the refresh flow
+hangs off.
+
+### Verifying M2
+
+38 tests green, covering the RFC 7636 Appendix B vector, single-use and session-bound state, PBKDF2
+round-trip and malformed-hash handling, and — the assertion that actually proves encryption at rest —
+that the token column read straight out of SQLite does not contain the plaintext.
+
+End-to-end against the running API and a real GitHub authorization:
+
+- Anonymous `/api/connections`, `/api/connections/GitHub/check`, and `/api/auth/github/authorize` all
+  return `401`. The same authorize URL with `Accept: text/html` redirects to the SPA login instead.
+- An authenticated `/authorize` returns a `302` to GitHub carrying `code_challenge` and
+  `code_challenge_method=S256`.
+- A second `/register` returns `409`; wrong password and unknown username both return an identical
+  `401 invalid_credentials`.
+- Walking the real consent flow in the browser links the account, and `?linked=github` is the only
+  thing that comes back to the SPA origin.
+- **Inspecting the raw database file:** the token columns contain Data Protection ciphertext
+  (`CfDJ8…`), the password is a `pbkdf2-sha256$600000$…` hash, and neither the GitHub token pattern
+  (`gh[opusr]_…`) nor the account password appears anywhere in the file.
+- **Across a process restart** (the token was written by an earlier process): logging in fresh
+  succeeds against the stored hash, and `/check` decrypts the stored token and GitHub accepts it,
+  answering with the linked account. Both halves of the encryption story survive the restart.
+- Unlinking flips the card back to "Not linked"; re-linking updates the single existing row rather
+  than adding a second.
 
 Still to come: refresh flow (M3), nonce and `id_token` validation (M4), real revocation and
 least-privilege scope expansion per widget (M5).
