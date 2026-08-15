@@ -103,6 +103,13 @@ builder.Services.AddOptions<GitHubOAuthOptions>()
     .ValidateOnStart();
 builder.Services.AddHttpClient<GitHubOAuthClient>();
 
+// --- Token refresh (M3) ------------------------------------------------------------------------
+// The lock registry is a singleton on purpose: its whole job is to be the one object two concurrent
+// requests can both see, so that only one of them spends a rotating refresh token. Registered as
+// scoped it would hand each request its own private mutex and quietly protect nothing.
+builder.Services.AddSingleton<RefreshLockRegistry>();
+builder.Services.AddScoped<ProviderTokenService>();
+
 builder.Services.AddCors(options =>
 {
     options.AddDefaultPolicy(policy => policy

@@ -42,5 +42,29 @@ public class LinkedAccount
     /// <summary>Null means "no expiry advertised" — not "already expired". M3 depends on that distinction.</summary>
     public DateTimeOffset? ExpiresAtUtc { get; set; }
 
+    /// <summary>
+    /// When the <em>refresh</em> token itself stops working (GitHub Apps: ~6 months; Google in
+    /// Testing mode: 7 days). Once this passes there is no automated way back — the user has to walk
+    /// the consent screen again — so it's worth surfacing rather than hitting as a surprise.
+    /// </summary>
+    public DateTimeOffset? RefreshTokenExpiresAtUtc { get; set; }
+
+    /// <summary>When the link was first established, or last re-established through a full consent.</summary>
     public DateTimeOffset ObtainedAtUtc { get; set; }
+
+    /// <summary>
+    /// When the access token was last replaced by the refresh grant, or null if it never has been.
+    /// Deliberately separate from <see cref="ObtainedAtUtc"/>: "this grant is three months old but
+    /// the token in it is four minutes old" is precisely what M3 is supposed to make true, and
+    /// collapsing the two timestamps would hide it.
+    /// </summary>
+    public DateTimeOffset? RefreshedAtUtc { get; set; }
+
+    /// <summary>
+    /// Set when the refresh path has proven it cannot recover this link — the refresh token was
+    /// rejected, or there was never one to begin with and the access token stopped working. It is a
+    /// latch, not a guess: once set, nothing but a fresh authorization clears it, so the dashboard
+    /// can show "Reconnect" instead of retrying a grant that is known dead.
+    /// </summary>
+    public DateTimeOffset? ReauthorizationRequiredAtUtc { get; set; }
 }

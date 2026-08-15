@@ -21,7 +21,7 @@ tests/OAuthDashboard.Tests/
 - [x] M0 — Register GitHub OAuth App + Google Cloud OAuth client, confirm CORS-connected hello world
 - [x] M1 — GitHub, hand-rolled, no persistence
 - [x] M2 — PKCE + encrypted persistence + local login
-- [ ] M3 — Refresh token flow
+- [x] M3 — Refresh token flow
 - [ ] M4 — Google + OIDC
 - [ ] M5 — Unified dashboard
 
@@ -194,8 +194,165 @@ End-to-end against the running API and a real GitHub authorization:
 - Unlinking flips the card back to "Not linked"; re-linking updates the single existing row rather
   than adding a second.
 
-Still to come: refresh flow (M3), nonce and `id_token` validation (M4), real revocation and
-least-privilege scope expansion per widget (M5).
+### M3 — the refresh flow
+
+The point of the milestone is that the rest of the application stops thinking about token lifetime.
+A caller asks for a GitHub access token; whether that involves a refresh POST, a retry, or nothing at
+all is decided in one place (`ProviderTokenService`), and every path that spends a token goes through
+it.
+
+**Two triggers, because either one alone is broken.** The *proactive* trigger refreshes a token whose
+recorded expiry is within two minutes. The *reactive* trigger refreshes when the provider answers
+`401` to a token the database believed was fine. Neither is redundant:
+
+- Proactive-only misses everything the stored metadata can't know. A user who revokes the grant from
+  their GitHub settings page leaves `ExpiresAtUtc` looking perfectly healthy, and a provider is free
+  to enforce an expiry it never advertised.
+- Reactive-only wastes a request every time, and turns an ordinary expiry into a user-visible
+  failure whenever the retry itself is the thing that fails.
+
+The two-minute leeway isn't clock-drift paranoia so much as arithmetic: a token with eight seconds
+left passes a naive `ExpiresAtUtc > UtcNow` check and then expires *in flight*. `expires_in` was also
+measured at the provider, and the network time between there and here is real.
+
+**`null` expiry is not `expired`, and this is where a refresh implementation usually goes wrong.** A
+standard GitHub OAuth App issues a non-expiring access token and *no refresh token at all*. If "no
+expiry recorded" were treated as "expired", every one of those links would be sent down a refresh
+path with nothing to refresh with, and a perfectly working connection would start demanding
+re-consent. The null survives from `GitHubOAuthClient` through the column to the comparison.
+
+**Refresh tokens rotate, which makes concurrent refresh a correctness bug rather than waste.** GitHub
+answers a refresh with a *new* refresh token and retires the one just used. So if two requests both
+notice the expired token and both POST the same refresh token, the second one presents a credential
+the provider has already retired — and presenting a used refresh token is precisely the signal OAuth
+implementations use to detect a stolen one, answered by revoking the entire grant. Two widgets
+loading at once could therefore log the user out of a provider nobody attacked. `RefreshLockRegistry`
+holds one mutex per `(user, provider)`, and the refresh path *re-reads the row after acquiring it* —
+whoever waited discovers the work is already done and uses the result instead of repeating it. The
+lock is per-process, which is the right size for this app and explicitly not enough behind more than
+one instance; that case needs the database row itself to be the lock.
+
+For the same reason the rotated refresh token is **persisted before the new access token is handed
+out**. GitHub has already retired the old one by the time the response arrives, so a crash between
+the POST and the write leaves the database holding a credential the provider will refuse.
+
+**"Rejected" and "failed" are different outcomes and get different types.** A `503`, a DNS failure or
+a timeout means *try again later*; `bad_refresh_token` means *this grant is over and no number of
+retries will change that*. `RefreshTokenRejectedException` reports what the provider said,
+`ReauthorizationRequiredException` reports what the app concluded — and the second covers a case the
+provider never speaks to, namely that there was no refresh token in the first place. Collapsing them
+would make the dashboard demand a re-link every time GitHub had a bad minute.
+
+Once a grant is known dead the link is **latched** (`ReauthorizationRequiredAtUtc`) and not retried.
+Rediscovering the same rejection on every page load spends rate limit to learn nothing, and each
+attempt is one more thing that looks like credential stuffing from the provider's side. Only a
+completed consent clears the latch — not a restart, not a lucky call. The dead tokens are left in the
+row rather than nulled out: they're useless but encrypted, and keeping the row whole means a broken
+link stays distinguishable from a link that never existed, which has a different remedy.
+
+**Exactly one retry, and sometimes none.** After a reactive refresh the call is retried once; a token
+minted seconds ago and refused immediately is not going to start working on the third attempt, and a
+refresh loop against a provider's rate limiter is its own outage. If the token was *already* replaced
+by the proactive path and the provider rejected it anyway, there is no retry at all — the grant
+behind it is dead, and refreshing again would only spend another rotation to obtain another token
+from the same dead grant.
+
+**The refresh grant has no `state`, no PKCE and no redirect — and that is not an oversight.** Those
+protect a flow that travels through the user agent, and this one never leaves the server: no browser,
+no address bar, no user present. What authenticates the caller here is the client secret plus
+possession of the refresh token. Which also makes the refresh token the more valuable of the two
+secrets — an access token is worth eight hours, a refresh token is worth six months — so it goes
+through the same `TokenProtector` and is subject to the same rule about never appearing in a log
+line.
+
+**A broken provider link answers `409`, not `401`.** The local session is entirely valid; it's the
+GitHub connection that's broken. Returning `401` would tell the SPA the user is logged out and send
+them to the wrong screen. The body carries a specific reason — `no_refresh_token`,
+`refresh_token_rejected`, `token_rejected_after_refresh` — so "reconnect" can be offered with the
+right explanation. `/api/connections` gained `reauthorizationRequired` and `canRefresh` for the same
+purpose: both are facts *about* the connection, derived from the token columns without exposing them.
+
+**The catch with GitHub specifically, stated plainly.** A standard GitHub **OAuth App** — which is
+what this project registered in M0 — never issues a refresh token. Its access token doesn't expire,
+so there is nothing to refresh, and the only M3 path it can actually reach is the dead end: revoke
+the token upstream, the next call gets `401`, there's no refresh token to recover with, and the link
+latches as needing re-authorization. That *is* the correct behaviour and it is worth seeing, but it
+means the happy path can't be exercised against this provider as registered. Reaching it needs either
+a GitHub **App** with expiring user tokens enabled, or Google in M4 — which is the more instructive
+one anyway, since Google only issues a refresh token when explicitly asked
+(`access_type=offline&prompt=consent`) and expires it after 7 days while the consent screen is in
+Testing mode.
+
+**Forcing the failure modes: `POST /api/dev/connections/{provider}/…`.** Verifying M3 by waiting out
+a token lifetime isn't verification, it's an afternoon, and the interesting paths can't be reproduced
+at all without clicking around in GitHub's settings. Four Development-only endpoints put a link into
+each state on demand: `expire-access-token` (backdates the recorded expiry → proactive trigger),
+`revoke-access-token` (replaces the token with a worthless one while *leaving the expiry alone* →
+reactive trigger), `break-refresh-token` (→ dead-grant path), and `clear-reauthorization-latch` (to
+re-run any of the above). They only ever damage the caller's own link — nothing there mints a token,
+widens a scope, or reads one out — and every action returns `404` outside Development, checked inside
+the action rather than at route registration, because a conditionally-mapped controller is one
+refactor away from being unconditionally mapped. The sabotaged values are still written as real
+ciphertext: raw junk in the column would fail at `Unprotect` with a crypto error, which is a
+different failure than the one being simulated.
+
+### Verifying M3
+
+62 tests green (38 from M2, 24 new). The ones that carry the milestone:
+
+- **The wire format of the refresh grant** — that it sends `grant_type=refresh_token` with the client
+  credentials and *not* `code`/`code_verifier`, that `expires_in` and `refresh_token_expires_in` are
+  converted from relative lifetimes to absolute instants at the moment the response arrives, and that
+  a rotated `refresh_token` comes back out. Tested by stubbing the `HttpMessageHandler` rather than
+  faking the client, because the details most likely to be wrong are exactly the ones a hand-written
+  fake would assume correct.
+- **That a failed refresh arrives as HTTP `200`** with an error in the body — a successful HTTP
+  transaction reporting an unsuccessful OAuth one. `bad_refresh_token`, `invalid_grant` and
+  `unauthorized_client` become a rejection; `server_error` deliberately does not.
+- **Both triggers**, separately: a token inside the leeway refreshes before any request goes out, and
+  a token the database calls valid but GitHub answers `401` to refreshes on the way back and retries.
+- **That a token with no advertised expiry is never refreshed**, which is the GitHub OAuth App case.
+- **The dead ends** — refresh token rejected, no refresh token to begin with, and a freshly refreshed
+  token rejected anyway — each latching the link and each reporting its own reason; a latched link
+  then stops calling the provider entirely, and the last of the three costs exactly one refresh POST
+  rather than two.
+- **That a `503` doesn't break the link**, so "unreachable" can't be mistaken for "revoked".
+- **The rotation race**: five concurrent requests against one expired link produce exactly one refresh
+  POST and all receive the same new token. Confirmed to be a real test by removing the shared lock and
+  watching it fail.
+- **That `ObtainedAtUtc` survives a refresh** while `RefreshedAtUtc` moves — "this grant is 30 days
+  old but the token in it is four minutes old" is the state M3 exists to produce, and one timestamp
+  can't express it.
+- **That the BFF boundary held** across the four new columns: the serialized connection summary
+  contains no `gho_`/`ghr_` material.
+
+To walk it by hand against the running API (`?refreshed` in the response is the observable — a
+transparent refresh leaves no other trace):
+
+```
+POST /api/dev/connections/GitHub/expire-access-token   # proactive trigger
+POST /api/dev/connections/GitHub/revoke-access-token   # reactive trigger (expiry left looking healthy)
+POST /api/dev/connections/GitHub/break-refresh-token   # dead-grant path
+GET  /api/connections/GitHub/check                     # the observable, after any of the above
+GET  /api/connections                                  # reauthorizationRequired / canRefresh
+POST /api/dev/connections/GitHub/clear-reauthorization-latch
+```
+
+What `/check` answers depends on which provider registration is linked, and the difference is the
+whole caveat above:
+
+- **A link that has a refresh token** (a GitHub App with expiring user tokens, or Google from M4):
+  the first two both answer `200 {"ok":true,"refreshed":true}` — the refresh happened and the user
+  never saw it. Only `break-refresh-token` reaches `409`, with `reason: refresh_token_rejected`.
+- **A stock GitHub OAuth App**, which has no refresh token at all: the first two answer
+  `409 {"reason":"no_refresh_token"}` and `/api/connections` then reports
+  `reauthorizationRequired: true`, `canRefresh: false`. Re-linking through the real consent flow
+  clears it. (`break-refresh-token` only means anything on a link that has one to break.)
+
+The happy path this registration can't produce is the one the automated tests cover.
+
+Still to come: nonce and `id_token` validation (M4), real revocation and least-privilege scope
+expansion per widget (M5).
 
 ## Running locally
 

@@ -49,6 +49,15 @@ namespace OAuthDashboard.Infrastructure.Persistence.Migrations
                         .HasMaxLength(128)
                         .HasColumnType("TEXT");
 
+                    b.Property<DateTimeOffset?>("ReauthorizationRequiredAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTimeOffset?>("RefreshTokenExpiresAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTimeOffset?>("RefreshedAtUtc")
+                        .HasColumnType("TEXT");
+
                     b.Property<string>("Scopes")
                         .HasMaxLength(512)
                         .HasColumnType("TEXT");

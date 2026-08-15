@@ -20,6 +20,7 @@ namespace OAuthDashboard.Api.Controllers;
 [Authorize]
 public class ConnectionsController(
     LinkedAccountService linkedAccounts,
+    ProviderTokenService providerTokens,
     GitHubOAuthClient gitHub,
     ILogger<ConnectionsController> logger) : ControllerBase
 {
@@ -28,19 +29,19 @@ public class ConnectionsController(
         await linkedAccounts.GetSummariesAsync(User.GetUserId(), ct);
 
     /// <summary>
-    /// Decrypts the stored token and spends it on a real provider call, reporting only whether it
-    /// still works.
+    /// Spends the stored token on a real provider call — refreshing it first if it has expired —
+    /// and reports whether it worked and whether a refresh was needed.
     /// </summary>
     /// <remarks>
-    /// This exists because M2's central claim — tokens survive a restart because the encryption round
-    /// trip works — is otherwise unverifiable from outside. Every other field on
+    /// This began as M2's falsifiability check: every other field on
     /// <see cref="LinkedAccountSummary"/> comes from an unencrypted column, so a completely broken
-    /// protector would still render a healthy-looking "Linked" card. This is the one path that proves
-    /// the ciphertext in SQLite can still be turned back into a working credential.
+    /// protector would still render a healthy-looking "Linked" card, and this is the one path that
+    /// proves the ciphertext in SQLite can still be turned back into a working credential.
     /// <para>
-    /// It's also the seed of M3: "use the stored token, notice it was rejected" is exactly the
-    /// signal the refresh flow will hang off. For now a 401 from the provider is only reported, not
-    /// acted on.
+    /// M3 gives it a second job for the same reason. A refresh that works is invisible by
+    /// construction — "the call succeeded" is equally consistent with "the token was refreshed" and
+    /// "it never needed to be". <see cref="ConnectionCheckResponse.Refreshed"/> is what separates
+    /// the two, so the milestone's claim can be checked rather than assumed.
     /// </para>
     /// </remarks>
     [HttpGet("{provider}/check")]
@@ -53,31 +54,44 @@ public class ConnectionsController(
         }
 
         var userId = User.GetUserId();
-        var accessToken = await linkedAccounts.GetAccessTokenAsync(userId, provider, ct);
-        if (accessToken is null)
-        {
-            return NotFound(new { error = "not_linked" });
-        }
 
         try
         {
-            var account = await gitHub.GetAuthenticatedUserAsync(accessToken, ct);
+            // The token never appears in this method. It is handed to the callback, spent, and
+            // forgotten; what comes back is the provider's answer.
+            var result = await providerTokens.CallAsync(
+                userId, provider, gitHub.GetAuthenticatedUserAsync, ct);
 
             logger.LogInformation(
-                "Verified stored {Provider} token for user {UserId} against the provider.", provider, userId);
+                "Verified stored {Provider} token for user {UserId} against the provider (refreshed: {Refreshed}).",
+                provider, userId, result.Refreshed);
 
-            // Returns the provider's answer, never the token that produced it.
-            return new ConnectionCheckResponse(provider.ToString(), true, account.DisplayName, null);
+            return new ConnectionCheckResponse(
+                provider.ToString(), Ok: true, result.Value.DisplayName, result.Refreshed, Reason: null);
+        }
+        catch (ProviderNotLinkedException)
+        {
+            return NotFound(new { error = "not_linked" });
+        }
+        catch (ReauthorizationRequiredException ex)
+        {
+            // 409, not 401: the local session is fine, and answering 401 would send the SPA to the
+            // wrong login screen. This says "the GitHub link is broken", not "you are logged out".
+            logger.LogWarning(
+                "The {Provider} link for user {UserId} needs re-authorization ({Reason}).",
+                provider, userId, ex.Reason);
+
+            return Conflict(new ConnectionCheckResponse(
+                provider.ToString(), Ok: false, AccountName: null, Refreshed: false, Reason: ex.Reason));
         }
         catch (HttpRequestException ex)
         {
-            logger.LogWarning(ex, "Stored {Provider} token failed verification.", provider);
+            // Anything left here is transport-level — the provider being unreachable is not a reason
+            // to tell the user their link is broken.
+            logger.LogWarning(ex, "Stored {Provider} token could not be verified.", provider);
 
-            var reason = ex.StatusCode == System.Net.HttpStatusCode.Unauthorized
-                ? "token_rejected"
-                : "provider_unreachable";
-
-            return new ConnectionCheckResponse(provider.ToString(), false, null, reason);
+            return new ConnectionCheckResponse(
+                provider.ToString(), Ok: false, AccountName: null, Refreshed: false, Reason: "provider_unreachable");
         }
     }
 
@@ -111,5 +125,10 @@ public class ConnectionsController(
 
 /// <param name="Ok">Whether the stored token still authenticates against the provider.</param>
 /// <param name="AccountName">The provider's own answer for who the token belongs to, on success.</param>
+/// <param name="Refreshed">
+/// Whether serving this call required the refresh grant. This is M3's observable: a successful
+/// transparent refresh leaves no other trace.
+/// </param>
 /// <param name="Reason">A machine-readable failure code, on failure.</param>
-public record ConnectionCheckResponse(string Provider, bool Ok, string? AccountName, string? Reason);
+public record ConnectionCheckResponse(
+    string Provider, bool Ok, string? AccountName, bool Refreshed, string? Reason);
