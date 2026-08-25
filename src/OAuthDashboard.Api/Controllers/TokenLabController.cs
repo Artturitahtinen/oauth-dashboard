@@ -63,7 +63,7 @@ public class TokenLabController(
     public Task<IActionResult> RevokeAccessToken(OAuthProvider provider, CancellationToken ct) =>
         MutateAsync(provider, "revoke-access-token", account =>
         {
-            account.EncryptedAccessToken = protector.Protect($"gho_notarealtoken{Guid.NewGuid():N}");
+            account.EncryptedAccessToken = protector.Protect(FakeAccessToken(provider));
         }, ct);
 
     /// <summary>
@@ -75,9 +75,26 @@ public class TokenLabController(
     public Task<IActionResult> BreakRefreshToken(OAuthProvider provider, CancellationToken ct) =>
         MutateAsync(provider, "break-refresh-token", account =>
         {
-            account.EncryptedRefreshToken = protector.Protect($"ghr_notarealtoken{Guid.NewGuid():N}");
+            account.EncryptedRefreshToken = protector.Protect(FakeRefreshToken(provider));
             account.ExpiresAtUtc = DateTimeOffset.UtcNow.AddMinutes(-1);
         }, ct);
+
+    /// <summary>
+    /// A well-formed but worthless token, shaped like the provider's own. The shape is cosmetic —
+    /// what matters is that the provider will refuse it — but a <c>gho_</c> value sitting in a Google
+    /// row makes a debugging session harder than it needs to be.
+    /// </summary>
+    private static string FakeAccessToken(OAuthProvider provider) => provider switch
+    {
+        OAuthProvider.Google => $"ya29.notarealtoken{Guid.NewGuid():N}",
+        _ => $"gho_notarealtoken{Guid.NewGuid():N}",
+    };
+
+    private static string FakeRefreshToken(OAuthProvider provider) => provider switch
+    {
+        OAuthProvider.Google => $"1//notarealtoken{Guid.NewGuid():N}",
+        _ => $"ghr_notarealtoken{Guid.NewGuid():N}",
+    };
 
     /// <summary>
     /// Clears the "needs re-authorization" latch without going through a consent screen, so the

@@ -8,8 +8,16 @@
     <PackageReference Include="Microsoft.AspNetCore.DataProtection.Abstractions" Version="10.0.11" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.11" />
     <PackageReference Include="Microsoft.Extensions.Caching.Abstractions" Version="10.0.11" />
+    <PackageReference Include="Microsoft.Extensions.Http" Version="10.0.11" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.11" />
     <PackageReference Include="Microsoft.Extensions.Options" Version="10.0.11" />
+    <!--
+      The only thing in this project not hand-rolled, and deliberately so: RSA signature
+      verification and JWKS parsing for Google's id_token (M4). A subtly wrong implementation of
+      those accepts forged tokens and looks perfectly healthy while doing it. The OIDC protocol
+      around them — discovery, the nonce, issuer/audience checks — is still written out by hand.
+    -->
+    <PackageReference Include="Microsoft.IdentityModel.JsonWebTokens" Version="8.22.0" />
   </ItemGroup>
 
   <PropertyGroup>

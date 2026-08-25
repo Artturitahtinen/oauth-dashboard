@@ -22,6 +22,7 @@ public class ConnectionsController(
     LinkedAccountService linkedAccounts,
     ProviderTokenService providerTokens,
     GitHubOAuthClient gitHub,
+    GoogleOAuthClient google,
     ILogger<ConnectionsController> logger) : ControllerBase
 {
     [HttpGet]
@@ -47,9 +48,18 @@ public class ConnectionsController(
     [HttpGet("{provider}/check")]
     public async Task<ActionResult<ConnectionCheckResponse>> Check(OAuthProvider provider, CancellationToken ct)
     {
-        if (provider != OAuthProvider.GitHub)
+        // Each provider's "who am I" call. Not a switch over behaviour — the refresh decision, the
+        // retry and the failure taxonomy are identical for both and live in ProviderTokenService —
+        // just over which endpoint the stored token gets spent on.
+        Func<string, CancellationToken, Task<ProviderAccountInfo>>? identityCall = provider switch
         {
-            // Google's client arrives in M4. Saying so beats a confusing generic failure.
+            OAuthProvider.GitHub => gitHub.GetAuthenticatedUserAsync,
+            OAuthProvider.Google => google.GetAuthenticatedUserAsync,
+            _ => null,
+        };
+
+        if (identityCall is null)
+        {
             return StatusCode(StatusCodes.Status501NotImplemented, new { error = "provider_not_implemented" });
         }
 
@@ -59,8 +69,7 @@ public class ConnectionsController(
         {
             // The token never appears in this method. It is handed to the callback, spent, and
             // forgotten; what comes back is the provider's answer.
-            var result = await providerTokens.CallAsync(
-                userId, provider, gitHub.GetAuthenticatedUserAsync, ct);
+            var result = await providerTokens.CallAsync(userId, provider, identityCall, ct);
 
             logger.LogInformation(
                 "Verified stored {Provider} token for user {UserId} against the provider (refreshed: {Refreshed}).",
@@ -92,6 +101,18 @@ public class ConnectionsController(
 
             return new ConnectionCheckResponse(
                 provider.ToString(), Ok: false, AccountName: null, Refreshed: false, Reason: "provider_unreachable");
+        }
+        catch (OpenIdConnectDiscoveryException ex)
+        {
+            // Google's endpoints are discovered rather than configured, so its metadata being
+            // unavailable is a new way for this call to fail — and it says nothing about the stored
+            // token. Same category as unreachable, reported under its own code so "we couldn't ask"
+            // stays distinguishable from "we asked and were refused".
+            logger.LogWarning(ex, "The {Provider} OIDC metadata could not be obtained.", provider);
+
+            return new ConnectionCheckResponse(
+                provider.ToString(), Ok: false, AccountName: null, Refreshed: false,
+                Reason: "provider_metadata_unavailable");
         }
     }
 

@@ -39,6 +39,13 @@ public class TokenRefreshTests : IAsyncLifetime
     private RefreshLockRegistry _locks = null!;
     private FakeGitHub _gitHub = null!;
     private GitHubOAuthClient _client = null!;
+
+    // M4's second provider. Present in every test because ProviderTokenService now depends on it,
+    // and exercised by the Google cases at the bottom of this file — the point of which is that the
+    // refresh *decision* did not have to change to accommodate a provider that behaves differently.
+    private FakeGoogle _google = null!;
+    private GoogleOAuthClient _googleClient = null!;
+
     private readonly List<DashboardDbContext> _contexts = [];
     private int _userId;
 
@@ -63,6 +70,9 @@ public class TokenRefreshTests : IAsyncLifetime
             }),
             NullLogger<GitHubOAuthClient>.Instance);
 
+        _google = new FakeGoogle();
+        _googleClient = _google.CreateClient();
+
         var db = NewContext();
         await db.Database.EnsureCreatedAsync();
 
@@ -79,6 +89,8 @@ public class TokenRefreshTests : IAsyncLifetime
 
     public async Task DisposeAsync()
     {
+        _google.Dispose();
+
         foreach (var context in _contexts)
         {
             await context.DisposeAsync();
@@ -387,6 +399,106 @@ public class TokenRefreshTests : IAsyncLifetime
         Assert.True(summary.CanRefresh);
     }
 
+    // --- M4: the same decision, a second provider -------------------------------------------------
+
+    /// <summary>
+    /// The milestone's structural claim: adding Google needed a new client and one line in a switch,
+    /// not a second copy of the refresh logic. Nothing in <c>ProviderTokenService</c> knows which
+    /// provider this is.
+    /// </summary>
+    [Fact]
+    public async Task GetAccessTokenAsync_RefreshesAnExpiredGoogleTokenThroughTheSameDecision()
+    {
+        await LinkGoogleAsync(expiresAtUtc: DateTimeOffset.UtcNow.AddMinutes(-1));
+        _google.AccessTokenToIssue = "ya29.refreshed";
+
+        var token = await CreateService().GetAccessTokenAsync(_userId, OAuthProvider.Google, CancellationToken.None);
+
+        Assert.Equal("ya29.refreshed", token.Value);
+        Assert.True(token.Refreshed);
+        Assert.Equal(1, _google.TokenCalls);
+    }
+
+    /// <summary>
+    /// Google does not rotate the refresh token: the refresh response contains none at all. The
+    /// stored one therefore has to survive untouched, or the *second* refresh finds nothing to spend
+    /// and the link demands a re-consent for no reason. This is the mirror image of GitHub's
+    /// rotation, and the same "write what the provider sent, keep what it didn't" rule covers both.
+    /// </summary>
+    [Fact]
+    public async Task GetAccessTokenAsync_KeepsGooglesRefreshTokenAcrossRepeatedRefreshes()
+    {
+        await LinkGoogleAsync(expiresAtUtc: DateTimeOffset.UtcNow.AddMinutes(-1));
+        Assert.Null(_google.RefreshTokenToIssue);
+
+        await CreateService().GetAccessTokenAsync(_userId, OAuthProvider.Google, CancellationToken.None);
+
+        var stored = await Accounts().GetTokenStateAsync(_userId, OAuthProvider.Google, CancellationToken.None);
+        Assert.NotNull(stored);
+        Assert.Equal("1//google-refresh", stored.RefreshToken);
+
+        // And again, from the state the first refresh left behind — the case that breaks if the
+        // stored value was overwritten with the response's absent one.
+        _google.AccessTokenToIssue = "ya29.refreshed-again";
+        await Accounts().UpdateAfterRefreshAsync(
+            _userId, OAuthProvider.Google,
+            new OAuthTokenResult(stored.AccessToken, null, null, DateTimeOffset.UtcNow.AddMinutes(-1)),
+            CancellationToken.None);
+
+        var token = await CreateService().GetAccessTokenAsync(_userId, OAuthProvider.Google, CancellationToken.None);
+
+        Assert.Equal("ya29.refreshed-again", token.Value);
+        Assert.Equal(2, _google.TokenCalls);
+    }
+
+    /// <summary>
+    /// Google reports a dead grant as HTTP <c>400 invalid_grant</c> where GitHub reports
+    /// <c>200 bad_refresh_token</c>. Both have to reach the same latch — a client that read only the
+    /// status code would see a transport failure here and retry forever.
+    /// </summary>
+    [Fact]
+    public async Task GetAccessTokenAsync_LatchesTheLinkWhenGoogleRejectsTheRefreshTokenWithA400()
+    {
+        await LinkGoogleAsync(expiresAtUtc: DateTimeOffset.UtcNow.AddMinutes(-1));
+        _google.TokenError = "invalid_grant";
+
+        var ex = await Assert.ThrowsAsync<ReauthorizationRequiredException>(
+            () => CreateService().GetAccessTokenAsync(_userId, OAuthProvider.Google, CancellationToken.None));
+
+        Assert.Equal("refresh_token_rejected", ex.Reason);
+
+        var summary = Assert.Single(
+            await Accounts().GetSummariesAsync(_userId, CancellationToken.None),
+            s => s.Provider == "Google");
+
+        Assert.True(summary.ReauthorizationRequired);
+    }
+
+    /// <summary>
+    /// The reactive trigger against Google's userinfo endpoint, and the BFF boundary holding for a
+    /// second set of token shapes.
+    /// </summary>
+    [Fact]
+    public async Task CallAsync_RefreshesAndRetriesAgainstGoogleAndLeaksNoTokenMaterial()
+    {
+        await LinkGoogleAsync(expiresAtUtc: DateTimeOffset.UtcNow.AddHours(4));
+        _google.AcceptedAccessToken = "nothing-matches-this";
+
+        var result = await CreateService().CallAsync(
+            _userId, OAuthProvider.Google, _googleClient.GetAuthenticatedUserAsync, CancellationToken.None);
+
+        Assert.Equal(FakeGoogle.Email, result.Value.DisplayName);
+        Assert.True(result.Refreshed);
+
+        var summary = Assert.Single(
+            await Accounts().GetSummariesAsync(_userId, CancellationToken.None),
+            s => s.Provider == "Google");
+
+        var serialized = System.Text.Json.JsonSerializer.Serialize(summary);
+        Assert.DoesNotContain("ya29.", serialized, StringComparison.Ordinal);
+        Assert.DoesNotContain("1//", serialized, StringComparison.Ordinal);
+    }
+
     // --- fixture plumbing -----------------------------------------------------------------------
 
     private DashboardDbContext NewContext()
@@ -401,7 +513,7 @@ public class TokenRefreshTests : IAsyncLifetime
     private LinkedAccountService Accounts() => new(NewContext(), _protector);
 
     private ProviderTokenService CreateService() => new(
-        Accounts(), _client, _locks, NullLogger<ProviderTokenService>.Instance);
+        Accounts(), _client, _googleClient, _locks, NullLogger<ProviderTokenService>.Instance);
 
     private async Task LinkAsync(
         DateTimeOffset? expiresAtUtc,
@@ -426,6 +538,14 @@ public class TokenRefreshTests : IAsyncLifetime
 
         _gitHub.AcceptedAccessToken = OriginalAccessToken;
     }
+
+    private Task LinkGoogleAsync(DateTimeOffset? expiresAtUtc, string? refreshToken = "1//google-refresh") =>
+        Accounts().UpsertAsync(
+            _userId,
+            OAuthProvider.Google,
+            new OAuthTokenResult("ya29.initial", refreshToken, "openid email profile", expiresAtUtc),
+            new ProviderAccountInfo(FakeGoogle.Subject, FakeGoogle.Email),
+            CancellationToken.None);
 
     /// <summary>
     /// A github.com that behaves the way the real one does in the ways that matter here: it accepts

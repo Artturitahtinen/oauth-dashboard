@@ -32,6 +32,7 @@ namespace OAuthDashboard.Infrastructure.Auth;
 public class ProviderTokenService(
     LinkedAccountService accounts,
     GitHubOAuthClient gitHub,
+    GoogleOAuthClient google,
     RefreshLockRegistry locks,
     ILogger<ProviderTokenService> logger)
 {
@@ -235,14 +236,21 @@ public class ProviderTokenService(
     }
 
     /// <summary>
-    /// The one provider-specific hop. M4 adds Google's client here; the surrounding decision —
-    /// when to refresh, what to do when it fails, how to avoid racing — is provider-agnostic and
-    /// stays where it is.
+    /// The one provider-specific hop, and — after M4 added Google beside GitHub — the evidence that
+    /// the decision above really is provider-agnostic. When to refresh, what to do when it fails and
+    /// how to avoid racing are the same questions for both; only the POST differs.
     /// </summary>
+    /// <remarks>
+    /// The two providers disagree about almost everything else on this path — GitHub rotates the
+    /// refresh token and reports failure as <c>200</c>, Google does neither — and every one of those
+    /// differences is absorbed inside the respective client, which is what keeps this a two-line
+    /// switch rather than a second copy of the logic above.
+    /// </remarks>
     private Task<OAuthTokenResult> RefreshWithProviderAsync(
         OAuthProvider provider, string refreshToken, CancellationToken ct) => provider switch
     {
         OAuthProvider.GitHub => gitHub.RefreshAccessTokenAsync(refreshToken, ct),
+        OAuthProvider.Google => google.RefreshAccessTokenAsync(refreshToken, ct),
         _ => throw new NotSupportedException($"No OAuth client is registered for {provider} yet."),
     };
 }

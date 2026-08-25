@@ -98,10 +98,38 @@ builder.Services.AddAuthorization();
 // --- Provider OAuth clients -------------------------------------------------------------------
 builder.Services.AddMemoryCache();
 builder.Services.AddSingleton<OAuthStateStore>();
+
 builder.Services.AddOptions<GitHubOAuthOptions>()
     .Bind(builder.Configuration.GetSection("OAuth:GitHub"))
+    // A missing client secret otherwise surfaces as an opaque `invalid_client` from the provider,
+    // three redirects later, with nothing in the message pointing at user-secrets. Checked here
+    // instead, at startup, where the remedy is obvious. `required` members do not cover this:
+    // the configuration binder constructs the options object without enforcing them.
+    .Validate(
+        options => !string.IsNullOrWhiteSpace(options.ClientId)
+                   && !string.IsNullOrWhiteSpace(options.ClientSecret)
+                   && !string.IsNullOrWhiteSpace(options.RedirectUri),
+        "OAuth:GitHub needs ClientId and ClientSecret (dotnet user-secrets) and RedirectUri (appsettings).")
     .ValidateOnStart();
 builder.Services.AddHttpClient<GitHubOAuthClient>();
+
+// --- Google / OIDC (M4) --------------------------------------------------------------------------
+builder.Services.AddOptions<GoogleOAuthOptions>()
+    .Bind(builder.Configuration.GetSection("OAuth:Google"))
+    .Validate(
+        options => !string.IsNullOrWhiteSpace(options.ClientId)
+                   && !string.IsNullOrWhiteSpace(options.ClientSecret)
+                   && !string.IsNullOrWhiteSpace(options.RedirectUri),
+        "OAuth:Google needs ClientId and ClientSecret (dotnet user-secrets) and RedirectUri (appsettings).")
+    .ValidateOnStart();
+
+// The discovery document and the JWKS are cached per authority, so this has to be the one instance
+// everything shares — registered scoped it would refetch Google's key set on every request, which is
+// both slow and a good way to get rate limited by the identity provider.
+builder.Services.AddHttpClient(OpenIdConnectDiscoveryCache.HttpClientName);
+builder.Services.AddSingleton<OpenIdConnectDiscoveryCache>();
+builder.Services.AddSingleton<IdTokenValidator>();
+builder.Services.AddHttpClient<GoogleOAuthClient>();
 
 // --- Token refresh (M3) ------------------------------------------------------------------------
 // The lock registry is a singleton on purpose: its whole job is to be the one object two concurrent

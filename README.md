@@ -22,7 +22,7 @@ tests/OAuthDashboard.Tests/
 - [x] M1 — GitHub, hand-rolled, no persistence
 - [x] M2 — PKCE + encrypted persistence + local login
 - [x] M3 — Refresh token flow
-- [ ] M4 — Google + OIDC
+- [x] M4 — Google + OIDC
 - [ ] M5 — Unified dashboard
 
 ## OAuth app registration
@@ -349,10 +349,203 @@ whole caveat above:
   `reauthorizationRequired: true`, `canRefresh: false`. Re-linking through the real consent flow
   clears it. (`break-refresh-token` only means anything on a link that has one to break.)
 
-The happy path this registration can't produce is the one the automated tests cover.
+The happy path this registration can't produce is the one the automated tests cover — and, from M4
+onwards, the one Google can be walked through by hand.
 
-Still to come: nonce and `id_token` validation (M4), real revocation and least-privilege scope
-expansion per widget (M5).
+### M4 — Google, and what OIDC adds on top of OAuth2
+
+M3 ended on a caveat: GitHub as registered can't demonstrate a working refresh. Google can, and
+that's the smaller half of this milestone. The larger half is the distinction Google forces:
+**OAuth2 answers "what may this app do", OpenID Connect answers "who is this"**, and the second is a
+different kind of claim with a different kind of proof.
+
+An access token is *opaque*. It says nothing; it is only spent, and the answer comes from the
+provider. An `id_token` is a *signed assertion* that arrives in this app's own hands and is read
+locally — which means it is worth exactly as much as the checks performed on it, and a JWT's payload
+is base64, not ciphertext. An unvalidated `id_token` is a claim the sender wrote down about
+themselves.
+
+**The endpoints are discovered, not configured.** Everything Google's flow touches — authorize,
+token, userinfo, JWKS, and the revocation endpoint M5 will need — comes out of
+`https://accounts.google.com/.well-known/openid-configuration`, cached for a day. The one thing that
+*is* configured is the authority, and that matters: OIDC Discovery §4.3 requires the `issuer` inside
+the document to equal the authority it was served from, and this app enforces it. Skipping that check
+is subtler than it looks, because the same document supplies the expected issuer that `id_token`
+validation later compares against — a document naming a different issuer would **validate its own
+tokens perfectly**. Issuer checking would run and check the wrong thing. The comparison has to be
+against the value an attacker can't supply.
+
+**Every `id_token` check, and the specific attack behind it.**
+
+| Check | What it stops |
+| --- | --- |
+| Signature against the published JWKS | Without it, the token is a suggestion |
+| Algorithm pinned to `RS256` | `alg: none`, and RS256→HS256 confusion |
+| `iss` equals the discovered issuer | Any provider asserting any user; `sub` is per-issuer |
+| `aud` equals this app's client id | A token Google minted for a *different* app becoming a login here |
+| `exp`, with 30s skew | A short-lived assertion honoured long after it stopped being short-lived |
+| `nonce` equals the one minted for this request | An `id_token` from another flow being replayed into this one |
+
+Two of those are worth expanding. **The audience check is the one that looks redundant and isn't.** A
+token from another Google client is genuinely Google's, genuinely signed, genuinely about this user —
+it just wasn't issued to this application, and anyone with a Google client id can obtain one. And
+**pinning the algorithm is a single line that closes both classic JWT breaks**, because both are the
+same bug: letting the token's own header tell the verifier how to verify it. `alg: none` says "no
+signature needed". HS256 confusion signs with HMAC using the provider's *public* key as the shared
+secret — which is published, by design — so a verifier that looks up "the key for `kid` X" and uses
+it however the header says finds an RSA public key and happily treats it as an HMAC secret.
+
+**Nonce, state and PKCE are three different proofs and none substitutes for another.** `state` proves
+*this callback answers a request we made*. `code_verifier` proves *this code is being redeemed by
+whoever asked for it*. `nonce` proves *this id_token was minted for that same request*. All three are
+now issued together in `OAuthStateStore` — the nonce as a separate random draw from the state, not a
+copy of it, since the state is public by construction the moment it reaches the address bar.
+
+Honest scoping on the nonce, in the same spirit as the PKCE note in M2: in the authorization **code**
+flow it adds less than it looks. The token arrives over a server-to-server POST, bound to a
+single-use code, itself bound to a verifier only this process holds. The nonce is what carries that
+guarantee in the *implicit* and *hybrid* flows, where the token lands in the browser and none of the
+above applies. It is implemented because the argument for skipping it depends on properties of the
+current deployment, and those stop holding quietly.
+
+**The one thing in this project that is deliberately not hand-rolled.** RSA signature verification and
+JWKS parsing use `Microsoft.IdentityModel.JsonWebTokens`. Everything else — discovery, the nonce, the
+issuer and audience comparisons, the token POSTs — is still written out against raw `HttpClient`. The
+line is drawn there because the failure mode of a subtly wrong signature implementation is *accepts
+forged tokens*, it is invisible in testing, and re-deriving PKCS#1 teaches nothing this project is
+about.
+
+**Signing keys rotate, and the refetch that handles it is a lever an attacker can pull.** Google
+publishes several keys and rotates them regularly, so a token can legitimately arrive bearing a `kid`
+the cached key set has never seen. The right response is to refetch — otherwise every rotation is an
+outage until the cache happens to expire. But "unknown kid, go ask Google again" is an outbound
+request this app performs on the say-so of an unauthenticated token, and an attacker can mint junk
+headers all day. So the refetch has a five-minute floor, matching what `Microsoft.IdentityModel`'s own
+`ConfigurationManager` defaults to. The cost is stated rather than hidden: a rotation within five
+minutes of a cache fill is not picked up until the floor passes. That's safe in practice because
+providers publish a new key well before signing with it, and the alternative is a request amplifier.
+
+One thing worth knowing rather than assuming: **the `kid` is a hint, not a gate.** When it doesn't
+match, the library tries every published key, and what rejects a forgery is the signature failing
+against all of them. A test asserting "unknown kid is rejected" passes for the wrong reason.
+
+**Google's conventions differ from GitHub's in ways that break a copied client.**
+
+- **A rejected grant is HTTP `400`, not `200`.** GitHub reports OAuth failures as a successful HTTP
+  transaction with an error in the body; Google uses the status code. A client that calls
+  `EnsureSuccessStatusCode` first turns "your refresh token is dead" — permanent, actionable — into a
+  generic transport exception, which `ProviderTokenService` quite correctly treats as transient and
+  never latches on. So the body is parsed first, and the status code is consulted only for failures
+  the body couldn't explain (a load balancer's HTML 5xx page, which must stay a transport failure).
+- **The refresh token has to be asked for.** `access_type=offline` is what makes Google issue one at
+  all; `prompt=consent` is what makes it issue one *again* on a repeat authorization. Without the
+  second, a re-link returns an access token and no refresh token, the stored one is correctly kept,
+  and the problem only surfaces whenever that older token finally dies.
+- **The refresh token does not rotate.** Google returns no `refresh_token` on a refresh and expects
+  the stored one to keep working — the mirror image of GitHub, which retires the old one every time.
+  Both are covered by the rule M2 already established: write what the provider sent, keep what it
+  didn't. (This makes M3's concurrency gate less load-bearing for Google, not wrong.)
+- **`invalid_grant` covers everything.** Revoked, expired, invalidated by a password change — all one
+  code, and the remedy is the same regardless. `invalid_client` is deliberately *not* treated as a
+  dead grant: that means this app's own credentials are wrong, and telling the user to reconnect
+  would be advice that can't work.
+- **No refresh-token lifetime is advertised.** There is one (7 days while the consent screen is in
+  Testing mode, otherwise until revoked or six months unused), but Google never states it, so
+  `RefreshTokenExpiresAtUtc` stays null rather than putting a guessed date on the connections card.
+
+**The link is keyed on `sub`, never on email.** Google is explicit that an address can be reassigned
+and that a user can change theirs. `email_verified` is carried for display and because an *unverified*
+address from any provider is a self-asserted string — matching accounts on one is the classic
+takeover path — but neither is what the row is matched on.
+
+**The identity comes from the assertion, not from an API call.** `GoogleAuthController` establishes
+the link from the validated `id_token`; the userinfo endpoint exists only so
+`/api/connections/Google/check` has a real call to spend the stored token on. A signed statement beats
+a response that merely arrived over TLS, and the check endpoint needs the *token* exercised, not the
+identity re-fetched.
+
+**Nothing is persisted when validation fails.** The exchange returns a `GoogleAuthorizationResult`
+carrying a `ValidatedIdToken` — a type only the validator can construct — or it throws. There is no
+overload that hands back an unchecked assertion, so "the token part looked fine, store it anyway" is
+not an available mistake. The callback maps that to `?error=id_token_invalid`.
+
+**What did *not* have to change.** `ProviderTokenService` gained one line in a switch. The refresh
+decision, the two triggers, the single retry, the failure taxonomy and the rotation gate are all
+provider-agnostic and stayed exactly as M3 left them — which is the structural claim the milestone
+makes, and the Google cases in `TokenRefreshTests` are there to hold it to that.
+
+Also folded in, since M4 is the milestone where a second set of client credentials makes it matter:
+startup now fails with a named message when either provider's `ClientId`/`ClientSecret`/`RedirectUri`
+is missing. `required` members don't cover this — the configuration binder constructs the options
+object without enforcing them — and the alternative is an opaque `invalid_client` from the provider,
+three redirects later, with nothing pointing at user-secrets.
+
+Still open: this is "link Google", not "log in with Google". Google now hands this app a verified
+identity, so building a login on it would be a short step — and a separate decision, with its own
+account-linking and takeover questions. The BFF split from M2 stands.
+
+### Verifying M4
+
+102 tests green (62 from M3, 40 new). The fake Google signs with a real 2048-bit RSA key it publishes
+in a real JWKS, because a test asserting "a forged signature is rejected" is worthless against a stub
+that only pretends to sign. The ones that carry the milestone:
+
+- **Every `id_token` check, broken one at a time.** A signature from an unpublished key, a payload
+  edited after signing, `alg: none`, an HS256 token signed with the provider's public key as the
+  secret, the wrong issuer, an audience belonging to another application, an expired token, a nonce
+  from a different flow, and a token with no nonce when one was requested — each rejected, each for
+  its own reason. Written this way because a validator with signature checking quietly disabled passes
+  every happy-path test ever written against it; only the negative cases can tell.
+- **That a missing nonce is accepted only on the refresh path**, where no authorization request
+  happened — and that the parameter has no default value, so skipping the check has to be deliberate.
+- **Key rotation**, with new key material and a new `kid`: one refetch, then validation succeeds. And
+  its counterpart — five forged tokens with unknown `kid`s produce **zero** extra requests to Google,
+  because the floor holds.
+- **Discovery**: the endpoints come from the document; a document naming a different issuer is
+  rejected; one missing an endpoint this app needs is rejected; an empty key set is rejected; eight
+  concurrent cold-start requests produce one fetch.
+- **The wire format**: `access_type=offline` and `prompt=consent` present, the nonce alongside `state`
+  and the S256 challenge, `expires_in` converted to an absolute instant, and the refresh grant sending
+  no `code`, `code_verifier` or `redirect_uri`.
+- **That Google's `400 invalid_grant` reaches the same latch as GitHub's `200 bad_refresh_token`**,
+  while `invalid_client` does not, and an HTML `503` stays a transport failure.
+- **That the stored refresh token survives repeated refreshes**, since Google never returns a new one.
+- **That the BFF boundary holds for a second token vocabulary** — no `ya29.` or `1//` material in the
+  serialized connection summary.
+
+Verified against the real provider metadata as well: the discovery document at
+`accounts.google.com` parses through this code with every required endpoint present, and its JWKS
+resolves to four usable RS256 signing keys.
+
+To walk it by hand, once the SPA and API are both running and you are logged in locally:
+
+```
+GET  /api/auth/google/authorize      # 302 to Google, carrying nonce + access_type + prompt
+                                     # → consent → /api/auth/google/callback → SPA ?linked=google
+GET  /api/connections                # Google alongside GitHub, canRefresh: true
+GET  /api/connections/Google/check   # spends the stored token on userinfo
+POST /api/dev/connections/Google/expire-access-token   # then /check → {"ok":true,"refreshed":true}
+POST /api/dev/connections/Google/break-refresh-token   # then /check → 409 refresh_token_rejected
+POST /api/dev/connections/Google/clear-reauthorization-latch
+```
+
+**This is where M3's happy path finally becomes observable against a real provider.** The GitHub OAuth
+App could only ever reach the dead end; Google, having actually issued a refresh token, answers
+`{"ok":true,"refreshed":true}` — a token replaced mid-request, with the user never sent near a consent
+screen.
+
+To watch validation fail closed rather than trusting it runs, the automated tests are the real
+answer — each breaks exactly one check. By hand, the observable is the log: a successful link writes
+
+```
+Validated an id_token from https://accounts.google.com (sub: …, email_verified: True, nonce checked: True)
+```
+
+*before* anything is persisted. Temporarily change `ValidAudience` in `IdTokenValidator` to any other
+string and re-link: Google still returns real tokens, that line never appears, nothing reaches the
+database, and the SPA gets `?error=id_token_invalid`.
+
+Still to come: real revocation on unlink and least-privilege scope expansion per widget (M5).
 
 ## Running locally
 

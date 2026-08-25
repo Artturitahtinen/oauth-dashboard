@@ -8,9 +8,15 @@ namespace OAuthDashboard.Infrastructure.Auth;
 /// One authorization attempt in flight, held server-side between the <c>/authorize</c> redirect and
 /// the provider's callback. None of this is ever sent to the browser except <see cref="State"/>.
 /// </summary>
+/// <param name="Nonce">
+/// The OIDC nonce (M4). Minted for every provider even though only Google echoes it back, because
+/// the alternative is a store that knows which providers speak OIDC — and a value that only exists
+/// on some code paths is a value someone eventually forgets to check on the others.
+/// </param>
 public record PendingAuthorization(
     string State,
     string CodeVerifier,
+    string Nonce,
     OAuthProvider Provider,
     int UserId);
 
@@ -30,6 +36,12 @@ public record PendingAuthorization(
 /// completed by the same logged-in user or not at all.
 /// </para>
 /// <para>
+/// M4 added a third, the OIDC <c>nonce</c>. All three protect different things and none substitutes
+/// for another: the <c>state</c> proves <em>this callback answers a request we made</em>, the
+/// <c>code_verifier</c> proves <em>this code is being redeemed by whoever asked for it</em>, and the
+/// <c>nonce</c> proves <em>this id_token was minted for that same request</em>.
+/// </para>
+/// <para>
 /// <see cref="IMemoryCache"/> is the right size for this: these entries are meant to be short-lived
 /// and disposable, and losing them on restart just means an in-flight link has to be retried. It
 /// does mean a backend restart mid-flow surfaces as <c>invalid_state</c> rather than as a hang.
@@ -42,13 +54,17 @@ public class OAuthStateStore(IMemoryCache cache)
     private static readonly TimeSpan Ttl = TimeSpan.FromMinutes(5);
 
     /// <summary>
-    /// Mints a fresh state + PKCE verifier pair for <paramref name="userId"/> and remembers it.
+    /// Mints a fresh state, PKCE verifier and nonce for <paramref name="userId"/> and remembers them.
     /// </summary>
     public PendingAuthorization Issue(OAuthProvider provider, int userId)
     {
         var pending = new PendingAuthorization(
-            State: GenerateState(),
+            State: NewRandomValue(),
             CodeVerifier: Pkce.NewCodeVerifier(),
+            // A separate draw, not a copy of the state. They are compared by different parties at
+            // different moments, and reusing one value for both would mean anyone who saw the
+            // authorize URL — where the state is public by construction — also knew the nonce.
+            Nonce: NewRandomValue(),
             Provider: provider,
             UserId: userId);
 
@@ -73,7 +89,8 @@ public class OAuthStateStore(IMemoryCache cache)
         return true;
     }
 
-    private static string GenerateState() =>
+    /// <summary>256 bits from a CSPRNG, base64url-encoded so it survives a query string unescaped.</summary>
+    private static string NewRandomValue() =>
         Convert.ToBase64String(RandomNumberGenerator.GetBytes(32))
             .TrimEnd('=')
             .Replace('+', '-')
