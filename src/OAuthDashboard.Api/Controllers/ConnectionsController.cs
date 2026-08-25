@@ -21,6 +21,7 @@ namespace OAuthDashboard.Api.Controllers;
 public class ConnectionsController(
     LinkedAccountService linkedAccounts,
     ProviderTokenService providerTokens,
+    ProviderRevocationService revocations,
     GitHubOAuthClient gitHub,
     GoogleOAuthClient google,
     ILogger<ConnectionsController> logger) : ControllerBase
@@ -117,18 +118,39 @@ public class ConnectionsController(
     }
 
     /// <summary>
-    /// Drops the local link. Route-bound to the <see cref="OAuthProvider"/> enum, so an unknown
-    /// provider name fails model binding with a 400 and never reaches the database as a string.
+    /// Unlinks a provider: asks the provider to revoke the grant, then deletes the local row.
+    /// Route-bound to the <see cref="OAuthProvider"/> enum, so an unknown provider name fails model
+    /// binding with a 400 and never reaches the database as a string.
     /// </summary>
     /// <remarks>
-    /// This is a local delete, not a revocation: GitHub still considers the grant live and the token
-    /// this app just discarded would keep working if a copy existed elsewhere. M5 replaces this with
-    /// a real unlink that calls the provider's revoke endpoint first, then deletes.
+    /// M5's completion of what M2 left half-done. Before this, "unlink" deleted a row and left the
+    /// authorization standing at the provider — the discarded token kept working for its full
+    /// lifetime, the app could mint a new one with no consent screen, and the user's provider settings
+    /// page still listed access they believed they had removed.
+    /// <para>
+    /// <b>Revoke first, then delete, and delete regardless.</b> The order is forced: after the delete
+    /// there is no credential left to present, so the grant could never be revoked afterwards. The
+    /// "regardless" is a judgement call, made explicit in the response — a provider outage must not be
+    /// able to trap a user in a link they asked to remove, and continuing to hold a token this app was
+    /// told to discard is the worse of the two failures. What the user gets instead of silence is the
+    /// truth: <c>revoked: false</c> plus the remedy, which is the provider's own settings page.
+    /// </para>
+    /// <para>
+    /// It answers <c>200</c> with a body rather than <c>204</c> for exactly that reason. A no-content
+    /// response can only say "done", and "done" is not always the whole story here.
+    /// </para>
     /// </remarks>
     [HttpDelete("{provider}")]
-    public async Task<IActionResult> Delete(OAuthProvider provider, CancellationToken ct)
+    public async Task<ActionResult<UnlinkResponse>> Delete(OAuthProvider provider, CancellationToken ct)
     {
         var userId = User.GetUserId();
+
+        // Deliberately not through ProviderTokenService: revoking must not first refresh. See the
+        // note on ProviderRevocationService — refreshing to revoke mints a credential in order to
+        // destroy it, spends a rotating refresh token to do it, and would refuse outright on a link
+        // already latched as broken, turning "this link is dead" into "you may not remove it".
+        var revocation = await revocations.RevokeAsync(userId, provider, ct);
+
         var deleted = await linkedAccounts.DeleteAsync(userId, provider, ct);
 
         if (!deleted)
@@ -137,12 +159,35 @@ public class ConnectionsController(
         }
 
         logger.LogInformation(
-            "Deleted local {Provider} link for user {UserId} (token discarded locally; not yet revoked upstream).",
-            provider, userId);
+            "Unlinked {Provider} for user {UserId}: local row deleted, upstream revocation {Outcome}.",
+            provider, userId, revocation.Outcome);
 
-        return NoContent();
+        return new UnlinkResponse(
+            provider.ToString(),
+            Deleted: true,
+            Revoked: revocation.GrantIsGone,
+            RevocationOutcome: revocation.Outcome.ToString(),
+            Detail: revocation.Detail);
     }
 }
+
+/// <param name="Deleted">Whether the local row is gone. True whenever this response is a 200.</param>
+/// <param name="Revoked">
+/// Whether the provider's side is known to be clean. False means a token this app no longer holds may
+/// still be live, and the user should finish the job at the provider.
+/// </param>
+/// <param name="RevocationOutcome">
+/// Which of <c>Revoked</c>, <c>AlreadyInvalid</c>, <c>NothingToRevoke</c>, <c>Unsupported</c> or
+/// <c>Unreachable</c> happened. Reported separately from the boolean because "the provider had nothing
+/// to revoke" and "the provider could not be reached" are both "not revoked by us" and mean opposite
+/// things to a user.
+/// </param>
+public record UnlinkResponse(
+    string Provider,
+    bool Deleted,
+    bool Revoked,
+    string RevocationOutcome,
+    string? Detail);
 
 /// <param name="Ok">Whether the stored token still authenticates against the provider.</param>
 /// <param name="AccountName">The provider's own answer for who the token belongs to, on success.</param>

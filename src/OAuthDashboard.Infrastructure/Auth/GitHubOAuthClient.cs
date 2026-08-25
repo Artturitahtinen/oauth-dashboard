@@ -1,9 +1,12 @@
+using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using OAuthDashboard.Core.Accounts;
 
 namespace OAuthDashboard.Infrastructure.Auth;
 
@@ -16,25 +19,34 @@ public class GitHubOAuthClient(HttpClient httpClient, IOptions<GitHubOAuthOption
 {
     private const string AuthorizeEndpoint = "https://github.com/login/oauth/authorize";
     private const string TokenEndpoint = "https://github.com/login/oauth/access_token";
-    private const string UserEndpoint = "https://api.github.com/user";
-
-    // Still the minimum scope needed to prove the flow (read the profile). Widgets that need
-    // repo/issue/PR data ask for those scopes when they're built (least privilege).
-    private const string Scope = "read:user";
+    private const string ApiRoot = "https://api.github.com";
+    private const string UserEndpoint = $"{ApiRoot}/user";
 
     /// <summary>
     /// Builds the URL the browser gets redirected to. Everything here is public by construction —
     /// it ends up in the address bar, browser history, and GitHub's logs — which is why the PKCE
     /// <em>challenge</em> goes in it and the verifier does not.
     /// </summary>
-    public string BuildAuthorizationUrl(string state, string codeChallenge)
+    /// <param name="additionalScope">
+    /// The one optional permission this authorization is adding, or null for a plain link. It comes
+    /// from <see cref="ProviderScopes"/>, never from the request — see the note there on why a
+    /// caller-supplied <c>scope</c> parameter on an authenticated endpoint is an escalation
+    /// primitive.
+    /// </param>
+    /// <remarks>
+    /// GitHub has no equivalent of Google's <c>include_granted_scopes</c> and does not need one: an
+    /// authorization is a set that new scopes are unioned into, so a token minted here carries
+    /// everything the user has previously granted plus whatever is requested now. The same property
+    /// is why re-authorizing with a smaller set cannot take a scope <em>away</em>.
+    /// </remarks>
+    public string BuildAuthorizationUrl(string state, string codeChallenge, OptionalScope? additionalScope = null)
     {
         var opts = options.Value;
         var query = string.Join('&', new[]
         {
             $"client_id={Uri.EscapeDataString(opts.ClientId)}",
             $"redirect_uri={Uri.EscapeDataString(opts.RedirectUri)}",
-            $"scope={Uri.EscapeDataString(Scope)}",
+            $"scope={Uri.EscapeDataString(ProviderScopes.RequestFor(OAuthProvider.GitHub, additionalScope))}",
             $"state={Uri.EscapeDataString(state)}",
             $"code_challenge={Uri.EscapeDataString(codeChallenge)}",
             "code_challenge_method=S256",
@@ -225,6 +237,162 @@ public class GitHubOAuthClient(HttpClient httpClient, IOptions<GitHubOAuthOption
         return await response.Content.ReadFromJsonAsync<JsonElement>(cancellationToken: ct);
     }
 
+    // --- M5: widget data ------------------------------------------------------------------------
+
+    /// <summary>
+    /// The repositories the user most recently pushed to, newest first.
+    /// </summary>
+    /// <remarks>
+    /// <c>visibility=public</c> is sent even though the base <c>read:user</c> scope could not return
+    /// a private repository anyway. It is a statement of intent rather than a filter that currently
+    /// does anything: if this app ever holds a token with <c>repo</c> on it — granted for some
+    /// unrelated widget — this call does not quietly start putting private repository names on a
+    /// dashboard whose card says "public repositories". A request that only behaves correctly
+    /// because of a scope it doesn't control is one scope change away from being wrong.
+    /// </remarks>
+    public async Task<List<GitHubRepository>> GetRecentRepositoriesAsync(
+        string accessToken, int count, CancellationToken ct)
+    {
+        var url = $"{UserEndpoint}/repos?sort=pushed&direction=desc&visibility=public&affiliation=owner&per_page={count}";
+        var payload = await GetJsonAsync(url, accessToken, ct);
+
+        return payload.EnumerateArray()
+            .Select(repo => new GitHubRepository(
+                Name: repo.GetProperty("name").GetString() ?? "(unnamed)",
+                Description: OptionalString(repo, "description"),
+                Language: OptionalString(repo, "language"),
+                StarCount: repo.TryGetProperty("stargazers_count", out var stars) ? stars.GetInt32() : 0,
+                PushedAtUtc: OptionalTimestamp(repo, "pushed_at"),
+                HtmlUrl: OptionalString(repo, "html_url")))
+            .ToList();
+    }
+
+    /// <summary>
+    /// The organizations the user belongs to. Needs the <c>read:org</c> scope, which is why the
+    /// widget behind it is opt-in.
+    /// </summary>
+    public async Task<List<GitHubOrganization>> GetOrganizationsAsync(string accessToken, CancellationToken ct)
+    {
+        var payload = await GetJsonAsync($"{UserEndpoint}/orgs?per_page=10", accessToken, ct);
+
+        return payload.EnumerateArray()
+            .Select(org => new GitHubOrganization(
+                Login: org.GetProperty("login").GetString() ?? "(unnamed)",
+                Description: OptionalString(org, "description"),
+                HtmlUrl: OptionalString(org, "html_url")))
+            .ToList();
+    }
+
+    // --- M5: revocation -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Revokes this app's entire authorization for the token's owner, so unlinking is something the
+    /// provider knows about rather than a row this app quietly forgets.
+    /// </summary>
+    /// <remarks>
+    /// <b>The grant, not the token.</b> GitHub offers both:
+    /// <c>DELETE /applications/{client_id}/token</c> retires one access token, and
+    /// <c>DELETE /applications/{client_id}/grant</c> retires the authorization itself along with
+    /// every token issued under it. Only the second is an unlink. After the first, the user's
+    /// authorization is still listed in their GitHub settings and this app can mint a new token
+    /// through <c>/authorize</c> with <em>no consent screen shown</em>, because the user already
+    /// consented and never took it back — so "unlink" would have removed a credential while leaving
+    /// the permission that produces credentials.
+    /// <para>
+    /// <b>The client secret authenticates this call, not the user's token.</b> Basic auth with
+    /// <c>client_id:client_secret</c> is what proves the caller is the application whose grant is
+    /// being dropped; the access token in the body is the subject of the request, not the
+    /// authorization for it. Sending it as a bearer token instead — the obvious guess — gets a 404,
+    /// because the endpoint isn't addressed to the user.
+    /// </para>
+    /// </remarks>
+    public async Task<RevocationOutcome> RevokeGrantAsync(string accessToken, CancellationToken ct)
+    {
+        var opts = options.Value;
+
+        using var request = new HttpRequestMessage(
+            HttpMethod.Delete, $"{ApiRoot}/applications/{Uri.EscapeDataString(opts.ClientId)}/grant");
+
+        request.Headers.Authorization = new AuthenticationHeaderValue(
+            "Basic",
+            Convert.ToBase64String(Encoding.UTF8.GetBytes($"{opts.ClientId}:{opts.ClientSecret}")));
+        request.Headers.UserAgent.Add(new ProductInfoHeaderValue("OAuthDashboard", "0.1"));
+        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
+
+        // The token is the object of the request. It is sent, once, to be destroyed — and it is not
+        // logged here or anywhere on this path.
+        request.Content = new StringContent(
+            JsonSerializer.Serialize(new { access_token = accessToken }), Encoding.UTF8, "application/json");
+
+        using var response = await httpClient.SendAsync(request, ct);
+
+        switch (response.StatusCode)
+        {
+            case HttpStatusCode.NoContent:
+                logger.LogInformation("GitHub revoked this application's grant.");
+                return RevocationOutcome.Revoked;
+
+            // 404 is the honest answer to "revoke a grant that isn't there" — a user who already
+            // revoked it from their GitHub settings page, or a token that expired out from under us.
+            // The end state is exactly the one asked for, so treating it as a failure would leave a
+            // local row that can never be deleted.
+            case HttpStatusCode.NotFound:
+            // 422 means GitHub could not match the token to this application, which likewise means
+            // there is nothing here of ours left to revoke.
+            case HttpStatusCode.UnprocessableEntity:
+                logger.LogInformation(
+                    "GitHub reports no live grant to revoke ({Status}); treating the link as already revoked.",
+                    (int)response.StatusCode);
+                return RevocationOutcome.AlreadyInvalid;
+
+            default:
+                // Anything else — 5xx, a rate limit, a proxy — is a transport failure and is allowed
+                // to propagate as one. The caller decides what to do about a revocation that could
+                // not be attempted, and that decision is deliberately not made here.
+                response.EnsureSuccessStatusCode();
+                return RevocationOutcome.Revoked;
+        }
+    }
+
+    private async Task<JsonElement> GetJsonAsync(string url, string accessToken, CancellationToken ct)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, url);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+        request.Headers.UserAgent.Add(new ProductInfoHeaderValue("OAuthDashboard", "0.1"));
+        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
+
+        using var response = await httpClient.SendAsync(request, ct);
+
+        if (response.StatusCode == HttpStatusCode.Forbidden)
+        {
+            // GitHub spends 403 on two unrelated things, and the header is what separates them: a
+            // depleted rate limit reports `x-ratelimit-remaining: 0`, while a missing scope does not.
+            // Collapsing them would either latch a permission problem as a temporary outage or tell a
+            // rate-limited user to grant a scope they already granted.
+            var rateLimited = response.Headers.TryGetValues("x-ratelimit-remaining", out var remaining)
+                              && remaining.FirstOrDefault() == "0";
+
+            if (!rateLimited)
+            {
+                throw new ProviderPermissionException("insufficient_scope");
+            }
+        }
+
+        // Left to throw with the status attached. A 401 here is what ProviderTokenService's reactive
+        // refresh trigger reads, so it has to keep its status code to stay distinguishable further up.
+        response.EnsureSuccessStatusCode();
+
+        return await response.Content.ReadFromJsonAsync<JsonElement>(cancellationToken: ct);
+    }
+
+    private static string? OptionalString(JsonElement element, string property) =>
+        element.TryGetProperty(property, out var value) && value.ValueKind is JsonValueKind.String
+            ? value.GetString()
+            : null;
+
+    private static DateTimeOffset? OptionalTimestamp(JsonElement element, string property) =>
+        DateTimeOffset.TryParse(OptionalString(element, property), out var parsed) ? parsed : null;
+
     private record GitHubTokenResponse(
         [property: JsonPropertyName("access_token")] string? AccessToken,
         [property: JsonPropertyName("refresh_token")] string? RefreshToken,
@@ -235,3 +403,22 @@ public class GitHubOAuthClient(HttpClient httpClient, IOptions<GitHubOAuthOption
         [property: JsonPropertyName("error")] string? Error,
         [property: JsonPropertyName("error_description")] string? ErrorDescription);
 }
+
+/// <summary>
+/// One repository, cut down to the fields the widget renders.
+/// </summary>
+/// <remarks>
+/// GitHub's repository object has well over a hundred fields. Modelling five of them is not
+/// laziness: the dashboard is a BFF, and a BFF that forwards a provider's response verbatim
+/// re-creates in the browser exactly the data exposure it was built to prevent. What the SPA cannot
+/// receive, an XSS bug on the SPA cannot read.
+/// </remarks>
+public record GitHubRepository(
+    string Name,
+    string? Description,
+    string? Language,
+    int StarCount,
+    DateTimeOffset? PushedAtUtc,
+    string? HtmlUrl);
+
+public record GitHubOrganization(string Login, string? Description, string? HtmlUrl);

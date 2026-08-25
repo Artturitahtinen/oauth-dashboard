@@ -37,15 +37,39 @@ public class GoogleAuthController(
 
     private string SpaOrigin => configuration["Spa:Origin"]!.TrimEnd('/');
 
+    /// <summary>
+    /// Starts an authorization, optionally an incremental one that adds a single widget's scope (M5).
+    /// </summary>
+    /// <param name="grant">
+    /// A key from <see cref="ProviderScopes.Optional"/>, never a scope string — see the note on
+    /// <see cref="GitHubAuthController.Authorize"/> for why an authenticated redirect endpoint must
+    /// not honour a caller-chosen scope.
+    /// </param>
     [HttpGet("authorize")]
-    public async Task<IActionResult> Authorize(CancellationToken ct)
+    public async Task<IActionResult> Authorize([FromQuery] string? grant, CancellationToken ct)
     {
+        OptionalScope? additionalScope = null;
+
+        if (!string.IsNullOrEmpty(grant) && !ProviderScopes.TryResolve(Provider, grant, out additionalScope))
+        {
+            logger.LogWarning("Refused a Google authorization for an unrecognized grant key.");
+            return BadRequest(new { error = "unknown_grant" });
+        }
+
         // state, verifier and nonce are minted together and stored server-side against the current
         // user. Only the state, the derived challenge and the nonce travel to Google.
         var pending = stateStore.Issue(Provider, User.GetUserId());
         var challenge = Pkce.CodeChallengeFor(pending.CodeVerifier);
 
-        var url = await client.BuildAuthorizationUrlAsync(pending.State, challenge, pending.Nonce, ct);
+        if (additionalScope is not null)
+        {
+            logger.LogInformation(
+                "Starting an incremental Google authorization for user {UserId}, adding {Scope}.",
+                pending.UserId, additionalScope.Scope);
+        }
+
+        var url = await client.BuildAuthorizationUrlAsync(
+            pending.State, challenge, pending.Nonce, additionalScope, ct);
 
         return Redirect(url);
     }

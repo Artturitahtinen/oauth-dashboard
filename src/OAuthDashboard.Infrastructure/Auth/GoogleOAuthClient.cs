@@ -1,9 +1,11 @@
+using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using OAuthDashboard.Core.Accounts;
 
 namespace OAuthDashboard.Infrastructure.Auth;
 
@@ -53,23 +55,18 @@ public class GoogleOAuthClient(
     IdTokenValidator idTokens,
     ILogger<GoogleOAuthClient> logger)
 {
-    /// <summary>
-    /// The minimum that makes this OIDC rather than plain OAuth2. <c>openid</c> is what causes an
-    /// <c>id_token</c> to be issued at all; <c>email</c>/<c>profile</c> put a display name on the
-    /// connection card. Calendar and Gmail scopes get added when a widget needs them (M5), not now —
-    /// a consent screen that asks for a user's mail to render a "Connected" badge is how users learn
-    /// to click through consent screens.
-    /// </summary>
-    private const string Scope = "openid email profile";
-
     private GoogleOAuthOptions Options => options.Value;
 
     /// <summary>
     /// Builds the URL the browser is redirected to. Async because the authorization endpoint is read
     /// from the discovery document rather than hardcoded.
     /// </summary>
+    /// <param name="additionalScope">
+    /// The one optional permission this authorization is adding, or null for a plain link. Resolved
+    /// from <see cref="ProviderScopes"/> by key; a caller never supplies a scope string.
+    /// </param>
     public async Task<string> BuildAuthorizationUrlAsync(
-        string state, string codeChallenge, string nonce, CancellationToken ct)
+        string state, string codeChallenge, string nonce, OptionalScope? additionalScope, CancellationToken ct)
     {
         var document = await discovery.GetDocumentAsync(Options.Authority, ct);
 
@@ -78,7 +75,19 @@ public class GoogleOAuthClient(
             "response_type=code",
             $"client_id={Uri.EscapeDataString(Options.ClientId)}",
             $"redirect_uri={Uri.EscapeDataString(Options.RedirectUri)}",
-            $"scope={Uri.EscapeDataString(Scope)}",
+
+            // Base scopes plus at most one widget's scope — never the union of everything the
+            // dashboard might eventually want. See ProviderScopes.
+            $"scope={Uri.EscapeDataString(ProviderScopes.RequestFor(OAuthProvider.Google, additionalScope))}",
+
+            // Google's incremental-authorization switch, and the reason least privilege is workable
+            // here at all. Without it, a token minted for this request carries *only* the scopes this
+            // request named: adding the calendar widget would hand back a token that can read events
+            // and can no longer read the profile the connection card is drawn from. The user's grant
+            // keeps every scope they have ever approved either way — this is about what lands on the
+            // new token, not about what they have consented to.
+            "include_granted_scopes=true",
+
             $"state={Uri.EscapeDataString(state)}",
 
             // The nonce goes out in the clear here and comes back inside the signed id_token, which
@@ -217,6 +226,30 @@ public class GoogleOAuthClient(
     /// </remarks>
     public async Task<ProviderAccountInfo> GetAuthenticatedUserAsync(string accessToken, CancellationToken ct)
     {
+        var user = await GetUserInfoJsonAsync(accessToken, ct);
+
+        var id = user.TryGetProperty("sub", out var sub)
+            ? sub.GetString() ?? throw new InvalidOperationException("Google userinfo returned a null sub.")
+            : throw new InvalidOperationException("Google userinfo response was missing sub.");
+
+        var displayName = user.TryGetProperty("email", out var email) ? email.GetString() : null;
+        displayName ??= user.TryGetProperty("name", out var name) ? name.GetString() : null;
+
+        return new ProviderAccountInfo(id, displayName ?? id);
+    }
+
+    /// <summary>
+    /// The raw userinfo response, for the dashboard widget that renders more of it than a display
+    /// name.
+    /// </summary>
+    /// <remarks>
+    /// The endpoint comes from the discovery document like every other one. Note what userinfo is
+    /// <em>not</em> used for: establishing the link. That comes from the signed <c>id_token</c>, and
+    /// the difference matters — this response is trusted only as far as "it arrived over TLS from the
+    /// discovered endpoint", which is enough to draw a card and not enough to key an account on.
+    /// </remarks>
+    public async Task<JsonElement> GetUserInfoJsonAsync(string accessToken, CancellationToken ct)
+    {
         var document = await discovery.GetDocumentAsync(Options.Authority, ct);
 
         using var request = new HttpRequestMessage(HttpMethod.Get, document.UserInfoEndpoint);
@@ -229,16 +262,75 @@ public class GoogleOAuthClient(
         // ProviderTokenService's reactive refresh trigger reads.
         response.EnsureSuccessStatusCode();
 
-        var user = await response.Content.ReadFromJsonAsync<JsonElement>(cancellationToken: ct);
+        return await response.Content.ReadFromJsonAsync<JsonElement>(cancellationToken: ct);
+    }
 
-        var id = user.TryGetProperty("sub", out var sub)
-            ? sub.GetString() ?? throw new InvalidOperationException("Google userinfo returned a null sub.")
-            : throw new InvalidOperationException("Google userinfo response was missing sub.");
+    // --- M5: revocation -------------------------------------------------------------------------
 
-        var displayName = user.TryGetProperty("email", out var email) ? email.GetString() : null;
-        displayName ??= user.TryGetProperty("name", out var name) ? name.GetString() : null;
+    /// <summary>
+    /// Hands a token back to Google with instructions to destroy it, along with everything derived
+    /// from it (RFC 7009).
+    /// </summary>
+    /// <remarks>
+    /// <b>Which token to send matters, and the answer is the refresh token.</b> Revoking a refresh
+    /// token invalidates the whole grant — the access tokens minted from it included. Revoking an
+    /// access token invalidates that one string and leaves the refresh token able to mint another,
+    /// which is an unlink that undoes itself the next time anything asks for a token. The caller
+    /// picks; this method only says what it was given.
+    /// <para>
+    /// <b>The endpoint is discovered, not hardcoded.</b> <c>revocation_endpoint</c> is optional in
+    /// OIDC Discovery, so its absence is a real answer — a provider that publishes no revocation
+    /// endpoint cannot be asked to revoke, and pretending otherwise by guessing a URL would report a
+    /// success that never happened. Google publishes one.
+    /// </para>
+    /// <para>
+    /// <b>RFC 7009 says revoking an already-invalid token is a success.</b> Google disagrees and
+    /// answers <c>400 invalid_token</c>, so that case is mapped explicitly: the state the caller
+    /// asked for — this credential does not work — is the state that already holds. Reporting it as a
+    /// failure would leave an unlink permanently blocked on revoking something that is already gone.
+    /// </para>
+    /// </remarks>
+    public async Task<RevocationOutcome> RevokeTokenAsync(string token, CancellationToken ct)
+    {
+        var document = await discovery.GetDocumentAsync(Options.Authority, ct);
 
-        return new ProviderAccountInfo(id, displayName ?? id);
+        if (document.RevocationEndpoint is null)
+        {
+            logger.LogWarning(
+                "The discovery document for {Authority} publishes no revocation_endpoint; the grant cannot be revoked.",
+                Options.Authority);
+
+            return RevocationOutcome.Unsupported;
+        }
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, document.RevocationEndpoint);
+        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+        request.Content = new FormUrlEncodedContent(new Dictionary<string, string> { ["token"] = token });
+
+        using var response = await httpClient.SendAsync(request, ct);
+
+        if (response.IsSuccessStatusCode)
+        {
+            logger.LogInformation("Google revoked the grant behind this link.");
+            return RevocationOutcome.Revoked;
+        }
+
+        // Read the body before deciding, for the same reason the token endpoint does: Google puts the
+        // meaning in the body and the severity in the status code, and a client that reads only the
+        // status turns "this token was already dead" into an outage.
+        var body = await response.Content.ReadAsStringAsync(ct);
+
+        if (response.StatusCode == HttpStatusCode.BadRequest
+            && body.Contains("invalid_token", StringComparison.Ordinal))
+        {
+            logger.LogInformation("Google reports the token was already invalid; treating the grant as revoked.");
+            return RevocationOutcome.AlreadyInvalid;
+        }
+
+        // Everything else is a transport-level problem and keeps its status code, so the caller can
+        // tell "we asked and were refused" from "we never got to ask".
+        response.EnsureSuccessStatusCode();
+        return RevocationOutcome.Revoked;
     }
 
     /// <summary>

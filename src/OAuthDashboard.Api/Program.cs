@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.DataProtection;
 using Microsoft.EntityFrameworkCore;
 using OAuthDashboard.Infrastructure.Accounts;
 using OAuthDashboard.Infrastructure.Auth;
+using OAuthDashboard.Infrastructure.Dashboard;
 using OAuthDashboard.Infrastructure.Persistence;
 using OAuthDashboard.Infrastructure.Security;
 using OAuthDashboard.Infrastructure.Users;
@@ -137,6 +138,19 @@ builder.Services.AddHttpClient<GoogleOAuthClient>();
 // scoped it would hand each request its own private mutex and quietly protect nothing.
 builder.Services.AddSingleton<RefreshLockRegistry>();
 builder.Services.AddScoped<ProviderTokenService>();
+
+// --- Unified dashboard and revocation (M5) -----------------------------------------------------
+// Google Calendar is a *resource* server, not the authorization server, and gets its own client for
+// that reason: nothing in the OIDC discovery document describes it, so its URL is a constant rather
+// than something looked up. See GoogleCalendarClient.
+builder.Services.AddHttpClient<GoogleCalendarClient>();
+
+// Scoped, and it takes IServiceScopeFactory rather than a DbContext: the dashboard fans out to every
+// widget concurrently, and DbContext is not thread-safe, so each branch runs in a child scope with a
+// context of its own. The singleton above is what still serializes their refreshes.
+builder.Services.AddScoped<DashboardService>();
+
+builder.Services.AddScoped<ProviderRevocationService>();
 
 builder.Services.AddCors(options =>
 {

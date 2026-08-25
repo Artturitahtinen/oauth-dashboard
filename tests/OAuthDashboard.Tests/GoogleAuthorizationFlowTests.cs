@@ -256,6 +256,11 @@ public class GoogleAuthorizationFlowTests : IDisposable
         Assert.Equal(FakeGoogle.Email, account.DisplayName);
     }
 
-    private Task<string> BuildAuthorizationUrlAsync() =>
-        _google.CreateClient().BuildAuthorizationUrlAsync(State, Challenge, Nonce, CancellationToken.None);
+    /// <summary>
+    /// A plain link: base scopes only, no widget's permission added. M5's incremental case is covered
+    /// in <c>ProviderScopeTests</c>.
+    /// </summary>
+    private Task<string> BuildAuthorizationUrlAsync(OptionalScope? additionalScope = null) =>
+        _google.CreateClient()
+            .BuildAuthorizationUrlAsync(State, Challenge, Nonce, additionalScope, CancellationToken.None);
 }

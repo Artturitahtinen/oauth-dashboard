@@ -37,15 +37,47 @@ public class GitHubAuthController(
 
     private string SpaOrigin => configuration["Spa:Origin"]!.TrimEnd('/');
 
+    /// <summary>
+    /// Starts an authorization. With no <paramref name="grant"/> this is a plain link, requesting the
+    /// base scope and nothing else; with one, it is an incremental authorization adding that single
+    /// widget's permission (M5).
+    /// </summary>
+    /// <param name="grant">
+    /// A key from <see cref="ProviderScopes.Optional"/> — <em>not</em> a scope string. The distinction
+    /// is the security property: this is an authenticated endpoint that redirects the user's browser
+    /// to a consent screen, so a <c>?scope=</c> parameter honoured verbatim would let anyone who can
+    /// get this user to follow a link choose which permissions the consent screen asks for. A key can
+    /// only ever resolve to a scope this code already decided it wanted.
+    /// </param>
     [HttpGet("authorize")]
-    public IActionResult Authorize()
+    public IActionResult Authorize([FromQuery] string? grant)
     {
+        OptionalScope? additionalScope = null;
+
+        if (!string.IsNullOrEmpty(grant) && !ProviderScopes.TryResolve(Provider, grant, out additionalScope))
+        {
+            // Refused rather than ignored. Quietly falling back to a base-scope authorization would
+            // send the user through a consent screen, come back looking successful, and leave the
+            // widget that asked for the scope reporting that it still needs one — a loop with nothing
+            // in it that says why. A caller asking for a grant that doesn't exist has a bug, and a
+            // 400 is where that gets found.
+            logger.LogWarning("Refused a GitHub authorization for an unrecognized grant key.");
+            return BadRequest(new { error = "unknown_grant" });
+        }
+
         // state + code_verifier are minted together and stored server-side against the current
         // user. Only the state and the derived challenge travel to GitHub.
         var pending = stateStore.Issue(Provider, User.GetUserId());
         var challenge = Pkce.CodeChallengeFor(pending.CodeVerifier);
 
-        return Redirect(client.BuildAuthorizationUrl(pending.State, challenge));
+        if (additionalScope is not null)
+        {
+            logger.LogInformation(
+                "Starting an incremental GitHub authorization for user {UserId}, adding {Scope}.",
+                pending.UserId, additionalScope.Scope);
+        }
+
+        return Redirect(client.BuildAuthorizationUrl(pending.State, challenge, additionalScope));
     }
 
     [HttpGet("callback")]

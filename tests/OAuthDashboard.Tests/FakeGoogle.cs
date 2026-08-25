@@ -39,6 +39,13 @@ internal sealed class FakeGoogle : IDisposable
     public const string JwksUri = "https://www.googleapis.com/oauth2/v3/certs";
     public const string RevocationEndpoint = "https://oauth2.googleapis.com/revoke";
 
+    /// <summary>
+    /// A <em>resource</em> server, and deliberately not in the discovery document — the metadata
+    /// contract covers identity endpoints, not APIs. The fake serves it from the same handler purely
+    /// because one handler is easier to wire than three.
+    /// </summary>
+    public const string CalendarEventsEndpoint = "https://www.googleapis.com/calendar/v3/calendars/primary/events";
+
     public const string Subject = "104729384756102938475";
     public const string Email = "tester@example.com";
 
@@ -65,6 +72,42 @@ internal sealed class FakeGoogle : IDisposable
 
     /// <summary>Set to publish an empty key set — a provider that signs with keys it never announced.</summary>
     public bool PublishNoKeys { get; set; }
+
+    /// <summary>
+    /// Set to publish a discovery document with no <c>revocation_endpoint</c>. It is optional in OIDC
+    /// Discovery, so a provider that omits it is well-formed and simply cannot be asked to revoke.
+    /// </summary>
+    public bool OmitRevocationEndpoint { get; set; }
+
+    /// <summary>
+    /// What the revocation endpoint answers. Google's success is a plain 200; its "that token was
+    /// already dead" is a 400 with <c>invalid_token</c> in the body, which RFC 7009 says should have
+    /// been a success.
+    /// </summary>
+    public HttpStatusCode RevocationStatus { get; set; } = HttpStatusCode.OK;
+
+    public string RevocationErrorBody { get; set; } = """{"error":"invalid_token"}""";
+
+    /// <summary>The token the last revocation request carried, so a test can assert *which* one was sent.</summary>
+    public string? RevokedToken { get; private set; }
+
+    /// <summary>Set to make the calendar endpoint answer 403 with this <c>reason</c>.</summary>
+    public string? CalendarForbiddenReason { get; set; }
+
+    /// <summary>
+    /// Held before answering the calendar endpoint, to make a per-widget timeout observable. Applied
+    /// by the handler as a cancellable <c>Task.Delay</c> rather than by blocking a thread — a slow
+    /// provider that ignores cancellation would make the test depend on how <c>HttpClient</c> happens
+    /// to handle a token firing mid-handler.
+    /// </summary>
+    public TimeSpan CalendarDelay { get; set; }
+
+    private int _revocationCalls;
+    private int _calendarCalls;
+
+    public int RevocationCalls => Volatile.Read(ref _revocationCalls);
+
+    public int CalendarCalls => Volatile.Read(ref _calendarCalls);
 
     /// <summary>What userinfo will accept as a bearer token. Anything else gets a 401.</summary>
     public string AcceptedAccessToken { get; set; } = "ya29.initial";
@@ -129,6 +172,35 @@ internal sealed class FakeGoogle : IDisposable
             return Json(HttpStatusCode.OK, JwksJson());
         }
 
+        if (request.Url.StartsWith(RevocationEndpoint, StringComparison.Ordinal))
+        {
+            Interlocked.Increment(ref _revocationCalls);
+            RevokedToken = request.Form("token");
+
+            return RevocationStatus == HttpStatusCode.OK
+                ? Json(HttpStatusCode.OK, "{}")
+                : Json(RevocationStatus, RevocationErrorBody);
+        }
+
+        if (request.Url.StartsWith(CalendarEventsEndpoint, StringComparison.Ordinal))
+        {
+            Interlocked.Increment(ref _calendarCalls);
+
+            if (CalendarForbiddenReason is { } reason)
+            {
+                // Built by substitution rather than interpolation: a Google API error body ends in
+                // three closing braces, which a raw interpolated string reads as delimiters.
+                var body = """{"error":{"code":403,"message":"refused","errors":[{"reason":"REASON"}]}}"""
+                    .Replace("REASON", reason, StringComparison.Ordinal);
+
+                return Json(HttpStatusCode.Forbidden, body);
+            }
+
+            return request.AccessToken == AcceptedAccessToken
+                ? Json(HttpStatusCode.OK, CalendarEventsJson)
+                : Json(HttpStatusCode.Unauthorized, """{"error":"invalid_token"}""");
+        }
+
         if (request.Url.StartsWith(TokenEndpoint, StringComparison.Ordinal))
         {
             Interlocked.Increment(ref _tokenCalls);
@@ -188,6 +260,7 @@ internal sealed class FakeGoogle : IDisposable
     private string DiscoveryJson()
     {
         var tokenEndpoint = OmitTokenEndpoint ? "" : $"\"token_endpoint\": \"{TokenEndpoint}\",";
+        var revocationEndpoint = OmitRevocationEndpoint ? "" : $"\"revocation_endpoint\": \"{RevocationEndpoint}\",";
 
         return $$"""
             {
@@ -196,12 +269,28 @@ internal sealed class FakeGoogle : IDisposable
               {{tokenEndpoint}}
               "userinfo_endpoint": "{{UserInfoEndpoint}}",
               "jwks_uri": "{{JwksUri}}",
-              "revocation_endpoint": "{{RevocationEndpoint}}",
+              {{revocationEndpoint}}
               "response_types_supported": ["code", "token", "id_token"],
               "id_token_signing_alg_values_supported": ["RS256"]
             }
             """;
     }
+
+    /// <summary>
+    /// Two events in Google's two mutually exclusive start shapes: a timed one with
+    /// <c>start.dateTime</c>, and an all-day one with a bare <c>start.date</c> and no time zone.
+    /// </summary>
+    private const string CalendarEventsJson =
+        """
+        {"items":[
+          {"summary":"Sprint review","location":"Room 4",
+           "start":{"dateTime":"2026-08-26T09:00:00+03:00"},
+           "htmlLink":"https://calendar.google.com/event?eid=one"},
+          {"summary":"Public holiday",
+           "start":{"date":"2026-08-28"},
+           "htmlLink":"https://calendar.google.com/event?eid=two"}
+        ]}
+        """;
 
     private string JwksJson()
     {
@@ -328,7 +417,11 @@ internal sealed class FakeGoogle : IDisposable
 
     private StubGoogleHandler? _handler;
 
-    public StubGoogleHandler Handler => _handler ??= new StubGoogleHandler(Respond);
+    public StubGoogleHandler Handler => _handler ??= new StubGoogleHandler(Respond)
+    {
+        DelayFor = request =>
+            request.Url.StartsWith(CalendarEventsEndpoint, StringComparison.Ordinal) ? CalendarDelay : TimeSpan.Zero,
+    };
 
     public OpenIdConnectDiscoveryCache CreateDiscoveryCache(OpenIdConnectCacheIntervals? intervals = null) =>
         new(new StubHttpClientFactory(Handler), NullLogger<OpenIdConnectDiscoveryCache>.Instance, intervals);
@@ -354,6 +447,13 @@ internal sealed class FakeGoogle : IDisposable
             NullLogger<GoogleOAuthClient>.Instance);
     }
 
+    /// <summary>
+    /// The calendar client shares the handler but nothing else — it has no discovery cache and no
+    /// options, because a resource server needs neither.
+    /// </summary>
+    public GoogleCalendarClient CreateCalendarClient() =>
+        new(new HttpClient(Handler, disposeHandler: false), NullLogger<GoogleCalendarClient>.Instance);
+
     private static HttpResponseMessage Json(HttpStatusCode status, string body) => new(status)
     {
         Content = new StringContent(body, Encoding.UTF8, "application/json"),
@@ -370,6 +470,12 @@ internal sealed class FakeGoogle : IDisposable
 /// <summary>Serves every Google endpoint from one handler, recording what was asked for.</summary>
 internal sealed class StubGoogleHandler(Func<StubGoogleRequest, HttpResponseMessage> respond) : HttpMessageHandler
 {
+    /// <summary>
+    /// How long to hold a request before answering it, per URL. Awaited on the request's own
+    /// cancellation token, so a caller's timeout is observed the way a real slow endpoint's would be.
+    /// </summary>
+    public Func<StubGoogleRequest, TimeSpan>? DelayFor { get; init; }
+
     protected override async Task<HttpResponseMessage> SendAsync(
         HttpRequestMessage request, CancellationToken cancellationToken)
     {
@@ -377,8 +483,15 @@ internal sealed class StubGoogleHandler(Func<StubGoogleRequest, HttpResponseMess
             ? string.Empty
             : await request.Content.ReadAsStringAsync(cancellationToken);
 
-        return respond(new StubGoogleRequest(
-            request.RequestUri!.ToString(), body, request.Headers.Authorization?.Parameter));
+        var captured = new StubGoogleRequest(
+            request.RequestUri!.ToString(), body, request.Headers.Authorization?.Parameter);
+
+        if (DelayFor?.Invoke(captured) is { } delay && delay > TimeSpan.Zero)
+        {
+            await Task.Delay(delay, cancellationToken);
+        }
+
+        return respond(captured);
     }
 }
 

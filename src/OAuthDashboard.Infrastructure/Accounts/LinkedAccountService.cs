@@ -182,6 +182,31 @@ public class LinkedAccountService(DashboardDbContext db, TokenProtector protecto
             .ToListAsync(ct);
 
     /// <summary>
+    /// The little the dashboard needs to know about every link before it fans out: which providers
+    /// exist, what they granted, and whether they are broken.
+    /// </summary>
+    /// <remarks>
+    /// Read once, up front, in the request's own scope — deliberately before any concurrency starts,
+    /// because <c>DbContext</c> is not thread-safe and this is the last database access the aggregator
+    /// makes on the shared one. Everything it answers here is answered without a provider call, which
+    /// is the point: a widget whose scope was never granted, or whose link is latched, should not cost
+    /// a request to the provider to be told what the local row already knew.
+    /// <para>
+    /// Typed on <see cref="OAuthProvider"/> rather than the string
+    /// <see cref="LinkedAccountSummary"/> carries, since this one is consumed by code that switches on
+    /// the provider rather than by a serializer.
+    /// </para>
+    /// </remarks>
+    public async Task<List<LinkedAccountState>> GetLinkStatesAsync(int userId, CancellationToken ct) =>
+        await db.LinkedAccounts.AsNoTracking()
+            .Where(a => a.UserId == userId)
+            .Select(a => new LinkedAccountState(
+                a.Provider,
+                a.Scopes,
+                a.ReauthorizationRequiredAtUtc != null))
+            .ToListAsync(ct);
+
+    /// <summary>
     /// Decrypts and returns the stored access token exactly as persisted, or null if this provider
     /// isn't linked. Server side only — this value must never reach a response body.
     /// </summary>
@@ -200,9 +225,16 @@ public class LinkedAccountService(DashboardDbContext db, TokenProtector protecto
     }
 
     /// <summary>
-    /// Deletes the local link. M5 replaces this with a real unlink that calls the provider's revoke
-    /// endpoint first — deleting the row alone leaves a live token in the provider's hands.
+    /// Deletes the local link.
     /// </summary>
+    /// <remarks>
+    /// Half of an unlink, and knowingly so. Deleting the row discards this app's copy of the
+    /// credential; it does not stop the credential working. The other half —
+    /// <c>ProviderRevocationService</c> — runs first, and the reason the order is that way round is
+    /// that once this method has run there is no token left to present, so the grant could never be
+    /// revoked afterwards. This one still runs even when revocation failed: see the note there on why
+    /// a provider outage must not be able to trap a user in a link they asked to remove.
+    /// </remarks>
     public async Task<bool> DeleteAsync(int userId, OAuthProvider provider, CancellationToken ct)
     {
         var deleted = await db.LinkedAccounts
@@ -230,6 +262,14 @@ public record LinkedAccountSummary(
     DateTimeOffset? RefreshTokenExpiresAtUtc,
     bool ReauthorizationRequired,
     bool CanRefresh);
+
+/// <summary>
+/// One link, reduced to the facts the dashboard's fan-out decides from. No token material, encrypted
+/// or otherwise — the same boundary <see cref="LinkedAccountSummary"/> holds, expressed for an
+/// internal caller instead of a serializer.
+/// </summary>
+/// <param name="Scopes">What the provider said it granted, in the provider's own delimiter.</param>
+public record LinkedAccountState(OAuthProvider Provider, string? Scopes, bool ReauthorizationRequired);
 
 /// <summary>
 /// The decrypted token state behind one link — the input the refresh decision is made from.
