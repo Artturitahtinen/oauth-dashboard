@@ -2,16 +2,16 @@
 
 ASP.NET Core Web API backend for a personal dashboard that aggregates your own GitHub and Google data. Built as a learning project: the OAuth2.0/OIDC token exchange is hand-rolled against raw `HttpClient` calls (no `Microsoft.AspNetCore.Authentication.Google`/`...OAuth` middleware), so the authorization code flow, PKCE, state parameter, and refresh token flow are all implemented and understood directly rather than hidden behind a framework abstraction.
 
-Frontend lives in the sibling repo `frontend-oauth-dashboard` (React + TypeScript + Vite).
+Frontend lives in `frontend/` (React + TypeScript + Vite).
 
 ## Architecture
 
 Backend-for-Frontend (BFF) pattern: the React SPA authenticates only against this backend's own session cookie. This backend is the *only* thing that ever holds GitHub/Google access and refresh tokens — the SPA never sees a provider token.
 
 ```
-src/OAuthDashboard.Api/             Program.cs, controllers, appsettings
-src/OAuthDashboard.Core/            domain models (User, LinkedAccount), IOAuthProviderClient
-src/OAuthDashboard.Infrastructure/  EF Core DbContext, GitHubOAuthClient, GoogleOAuthClient, TokenProtector,
+backend/src/OAuthDashboard.Api/             Program.cs, controllers, appsettings
+backend/src/OAuthDashboard.Core/            domain models (User, LinkedAccount), IOAuthProviderClient
+backend/src/OAuthDashboard.Infrastructure/  EF Core DbContext, GitHubOAuthClient, GoogleOAuthClient, TokenProtector,
                                     ProviderTokenService, DashboardService, ProviderRevocationService
 tests/OAuthDashboard.Tests/
 ```
@@ -36,7 +36,7 @@ allowed to see an authorization code, let alone a token.
 | GitHub OAuth App | `https://localhost:7236/api/auth/github/callback` |
 | Google OAuth client (Web application) | `https://localhost:7236/api/auth/google/callback` |
 
-Client credentials live in `dotnet user-secrets` for `src/OAuthDashboard.Api`, under
+Client credentials live in `dotnet user-secrets` for `backend/src/OAuthDashboard.Api`, under
 `OAuth:GitHub:ClientId` / `ClientSecret` and `OAuth:Google:ClientId` / `ClientSecret`. The Google
 consent screen stays in Testing mode with the developer's own account as a test user.
 
@@ -844,8 +844,8 @@ dotnet dev-certs https --trust
 Then:
 
 ```
-dotnet user-secrets init --project src/OAuthDashboard.Api
-dotnet run --launch-profile https --project src/OAuthDashboard.Api
+dotnet user-secrets init --project backend/src/OAuthDashboard.Api
+dotnet run --launch-profile https --project backend/src/OAuthDashboard.Api
 ```
 
 `GET https://localhost:7236/api/health` is the connectivity probe. Called twice from the SPA it
@@ -857,9 +857,9 @@ The SQLite schema is applied on startup (`Database.MigrateAsync()`), so there's 
 pinned as a repo-local tool for *creating* migrations:
 
 ```
-dotnet dotnet-ef migrations add <Name> --project src/OAuthDashboard.Infrastructure --startup-project src/OAuthDashboard.Api --output-dir Persistence/Migrations
+dotnet dotnet-ef migrations add <Name> --project backend/src/OAuthDashboard.Infrastructure --startup-project backend/src/OAuthDashboard.Api --output-dir Persistence/Migrations
 ```
 
 On first run the SPA's login screen offers to claim the single local account; after that it asks for
-those credentials. To start over, delete `src/OAuthDashboard.Api/oauthdashboard.db` (gitignored — it
+those credentials. To start over, delete `backend/src/OAuthDashboard.Api/oauthdashboard.db` (gitignored — it
 holds encrypted provider tokens).

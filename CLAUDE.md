@@ -9,7 +9,7 @@ handling and the refresh grant are implemented against raw `HttpClient` rather t
 `Microsoft.AspNetCore.Authentication.OAuth`/`...Google` middleware. **Do not replace the hand-rolled
 flow with provider middleware** — the explicit implementation is the point of the project.
 
-The React SPA lives in the sibling repo `frontend-oauth-dashboard`.
+The repo is a monorepo: this .NET backend lives in `backend/`, the React SPA in `frontend/` (merged from the former `frontend-oauth-dashboard` repo, history preserved). Run `dotnet` commands from `backend/`.
 
 ## Commands
 
@@ -20,10 +20,10 @@ dotnet test --filter "FullyQualifiedName~TokenRefreshTests"          # one class
 dotnet test --filter "FullyQualifiedName~GetAccessTokenAsync_DoesNotRefreshATokenWithNoAdvertisedExpiry"  # one test
 
 dotnet dev-certs https --trust                   # once; otherwise the SPA and the provider redirect both fail
-dotnet run --launch-profile https --project src/OAuthDashboard.Api    # https://localhost:7236
+dotnet run --launch-profile https --project backend/src/OAuthDashboard.Api    # https://localhost:7236
 ```
 
-Secrets live in `dotnet user-secrets` for `src/OAuthDashboard.Api` under `OAuth:GitHub:ClientId` /
+Secrets live in `dotnet user-secrets` for `backend/src/OAuthDashboard.Api` under `OAuth:GitHub:ClientId` /
 `ClientSecret` and `OAuth:Google:ClientId` / `ClientSecret`. Non-secret config — `Spa:Origin`,
 `ConnectionStrings:Dashboard`, `OAuth:{GitHub,Google}:RedirectUri`, `OAuth:Google:Authority` — is in
 `appsettings.Development.json`. Startup throws if `Spa:Origin`, the connection string, or either
@@ -39,12 +39,12 @@ on them — don't "fix" that widget in code.
 Migrations (`dotnet-ef` is pinned as a repo-local tool in `dotnet-tools.json`):
 
 ```bash
-dotnet dotnet-ef migrations add <Name> --project src/OAuthDashboard.Infrastructure \
-  --startup-project src/OAuthDashboard.Api --output-dir Persistence/Migrations
+dotnet dotnet-ef migrations add <Name> --project backend/src/OAuthDashboard.Infrastructure \
+  --startup-project backend/src/OAuthDashboard.Api --output-dir Persistence/Migrations
 ```
 
 There is no `database update` step — `Program.cs` calls `Database.MigrateAsync()` on startup. To
-reset state, delete `src/OAuthDashboard.Api/oauthdashboard.db` (gitignored).
+reset state, delete `backend/src/OAuthDashboard.Api/oauthdashboard.db` (gitignored).
 
 ## Architecture
 
