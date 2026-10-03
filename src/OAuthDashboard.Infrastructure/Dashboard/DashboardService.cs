@@ -187,7 +187,9 @@ public class DashboardService(
         }
         catch (Exception ex)
         {
-            // A deliberate catch-all, and the one place in this codebase that has one. A provider that
+            // A deliberate catch-all — one of only two in this codebase that convert an unexpected
+            // failure into a reported outcome rather than rethrowing it as a typed one (the other is
+            // ProviderRevocationService's unreadable-credentials path). A provider that
             // changes a field's type, a null where the shape promised a string — anything unhandled in
             // one widget's parsing must cost that widget and not the page. Logged at Error precisely
             // because this branch also catches genuine bugs, and a bug that only shows up as a grey

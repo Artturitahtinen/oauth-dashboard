@@ -11,7 +11,8 @@ Backend-for-Frontend (BFF) pattern: the React SPA authenticates only against thi
 ```
 src/OAuthDashboard.Api/             Program.cs, controllers, appsettings
 src/OAuthDashboard.Core/            domain models (User, LinkedAccount), IOAuthProviderClient
-src/OAuthDashboard.Infrastructure/  EF Core DbContext, GitHubOAuthClient, GoogleOAuthClient, TokenEncryptionService
+src/OAuthDashboard.Infrastructure/  EF Core DbContext, GitHubOAuthClient, GoogleOAuthClient, TokenProtector,
+                                    ProviderTokenService, DashboardService, ProviderRevocationService
 tests/OAuthDashboard.Tests/
 ```
 
@@ -23,7 +24,7 @@ tests/OAuthDashboard.Tests/
 - [x] M2 — PKCE + encrypted persistence + local login
 - [x] M3 — Refresh token flow
 - [x] M4 — Google + OIDC
-- [ ] M5 — Unified dashboard
+- [x] M5 — Unified dashboard, real revocation, per-widget scopes
 
 ## OAuth app registration
 
@@ -38,6 +39,13 @@ allowed to see an authorization code, let alone a token.
 Client credentials live in `dotnet user-secrets` for `src/OAuthDashboard.Api`, under
 `OAuth:GitHub:ClientId` / `ClientSecret` and `OAuth:Google:ClientId` / `ClientSecret`. The Google
 consent screen stays in Testing mode with the developer's own account as a test user.
+
+Two more steps in the Google Cloud project, needed by M5's calendar widget rather than by the link
+itself: **enable the Google Calendar API** (APIs & Services → Library), and add
+`https://www.googleapis.com/auth/calendar.events.readonly` to the consent screen's scope list. Without
+the first, the widget reports `permission_denied` / `accessNotConfigured` — deliberately distinguished
+from a missing scope, because re-consenting cannot fix it. Without the second, the incremental
+authorization itself is refused with `invalid_scope`. Everything else on the dashboard works either way.
 
 ## Security learning notes
 
@@ -545,7 +553,283 @@ Validated an id_token from https://accounts.google.com (sub: …, email_verified
 string and re-link: Google still returns real tokens, that line never appears, nothing reaches the
 database, and the SPA gets `?error=id_token_invalid`.
 
-Still to come: real revocation on unlink and least-privilege scope expansion per widget (M5).
+### M5 — one dashboard, real revocation, and scopes asked for one at a time
+
+The first four milestones acquired tokens, protected them, and kept them alive. M5 is the one that
+finally *spends* them for something the user asked for — and spending them turns three arguments into
+code: what happens when several requests need the same token at once, what "unlink" is supposed to
+mean, and whether "least privilege" is a claim or a check.
+
+**`GET /api/dashboard` is one request, and that is the BFF's job description.** The alternative
+architecture — the SPA calling GitHub and Google itself — requires the browser to hold provider
+tokens, which is the one thing this project has spent five milestones not doing. So the fan-out happens
+here, and what crosses to the browser is a normalized list of rows with no credential of any kind in it.
+
+**Normalizing is the BFF earning its name twice.** Once for simplicity: one renderer instead of one per
+provider. And once for exposure — a GitHub repository object has well over a hundred fields and a
+calendar event carries attendee addresses, so a backend that forwards either verbatim has put all of it
+in the browser's memory, its network log, and the reach of any script on the page. Five fields go out
+because five fields get drawn. What the SPA never receives, an XSS bug on the SPA cannot read.
+
+**`Task.WhenAll` is why per-widget failure isolation has to be deliberate.** It surfaces the *first*
+exception its branches threw and discards the rest — so an aggregator whose branches are allowed to
+throw doesn't merely fail, it fails while hiding what every other provider said. Every branch converts
+its own failure into a result instead, which is what makes "GitHub is down, the calendar still renders"
+true rather than aspirational. Each widget also gets its own timeout budget rather than the request
+having one, so a slow provider costs its own card and not the page.
+
+| Widget status | What it means | Remedy |
+| --- | --- | --- |
+| `ok` | Loaded | — |
+| `not_linked` | No link row | Connect |
+| `reauthorization_required` | M3's latch: broken past what a refresh can fix | Re-consent |
+| `scope_required` | Healthy link, this permission never granted | Opt in to one scope |
+| `permission_denied` | Token accepted, request refused | Depends — see below |
+| `unavailable` | Provider unreachable, or answered unusably | Wait |
+| `timed_out` | Provider too slow; the page didn't wait | Wait |
+
+**Every one of those is a `200`.** The status code describes the aggregation, not the providers: the
+request succeeded, and here is what each provider said. Mapping the worst widget onto the HTTP status
+would make a dashboard where four cards work look broken — and a SPA that branches on 401 would go to
+the login screen because GitHub had a bad minute.
+
+**Three of those states are decided locally, before any request goes out.** Not linked, latched, and
+missing-scope are all answerable from the link row, so they are answered there. Spending a provider
+request to be told something the database already knew costs rate limit to learn nothing, and in the
+scope case the provider's answer arrives as a 403 that looks like several other problems.
+
+**Each branch runs in its own DI scope, and that is a correctness fix rather than a style choice.**
+`DbContext` is not thread-safe, and everything on the token path — `LinkedAccountService`,
+`ProviderTokenService` — is scoped to the request. Five widgets sharing one context is five concurrent
+operations on it, which EF Core refuses outright ("a second operation was started on this context"). So
+each widget gets a child scope with a context of its own. `RefreshLockRegistry` stays the singleton
+every one of them shares, which is exactly what keeps the next paragraph true.
+
+**The fan-out is the scenario M3's rotation gate was built for, and M5 is the code that causes it.**
+Three GitHub widgets loading against a link whose access token expired five minutes ago is three
+concurrent requests all noticing the same expiry. Without the per-(user, provider) gate, all three POST
+the same refresh token; GitHub rotates it, so two of them present a credential GitHub has already
+retired — which is precisely the signal a provider is entitled to read as a stolen refresh token and
+answer by killing the grant. **The dashboard would log the user out of a provider nobody attacked.**
+With the gate, one branch refreshes and the other two re-read the row and use its result. M3 argued
+this case in the abstract; here it is a test that counts refresh POSTs and expects one.
+
+**The fan-out holds a deliberate catch-all `Exception`, and that is rare here for a reason.** The other
+broad catches in this codebase immediately narrow — `IdTokenValidator` and
+`OpenIdConnectDiscoveryCache` rethrow as typed failures. Only two convert an unexpected failure into a
+reported outcome, and both are M5's: this one, and the unreadable-credentials path in revocation. Here
+it earns it — a provider that changes a field's type, a null where the shape promised a string,
+anything unhandled in one widget's parsing must cost that widget and not the page. It logs at `Error`
+precisely because it also catches genuine bugs, and a bug that only ever shows up as a grey card is a
+bug nobody fixes.
+
+#### Unlinking that the provider is told about
+
+Before M5, `DELETE /api/connections/{provider}` deleted a row. That was never an unlink. **A token this
+app discards keeps working**: GitHub still lists the authorization in the user's settings, Google still
+counts the grant, and any leaked copy (a log line, a backup, the SQLite file from M2's threat model)
+stays live for its full lifetime — while this app could mint a fresh token through `/authorize` **with no
+consent screen shown**, because the user consented once and never took it back. Only the provider can
+make a credential stop working.
+
+**The two providers express "drop the grant" differently, and neither difference is cosmetic.**
+
+- **GitHub revokes by application.** `DELETE /applications/{client_id}/grant`, *not* `…/token` — the
+  token endpoint retires one access token and leaves the authorization standing, so it would remove a
+  credential while leaving the permission that produces credentials. And the call is authenticated with
+  **Basic `client_id:client_secret`**: the client secret proves the caller is the application whose
+  grant is being dropped, while the access token travels in the *body* as the subject of the request.
+  Sending it as a bearer token — the obvious guess — gets a 404, because the endpoint isn't addressed to
+  the user. `404`/`422` are mapped to "already invalid": revoking a grant the user already removed from
+  their settings page reaches the desired end state, and calling that a failure would leave a local row
+  that can never be deleted.
+- **Google revokes by token** (RFC 7009), at the `revocation_endpoint` from the discovery document —
+  optional in the spec, so its absence is a real answer rather than a licence to guess a URL. **The
+  refresh token is the one to send.** Revoking a refresh token takes the whole grant with it, derived
+  access tokens included; revoking an access token retires one string and leaves the refresh token able
+  to mint another, which is an unlink that undoes itself the next time anything asks for a token. RFC
+  7009 says revoking an already-invalid token is a success; Google answers `400 invalid_token`, so that
+  case is read out of the body rather than mistaken for an outage.
+
+**This path deliberately does not go through `ProviderTokenService`,** which is otherwise the rule for
+anything that spends a token. Refreshing in order to revoke mints a brand-new credential for the sole
+purpose of destroying it — and with GitHub's rotation it spends the stored refresh token to do so, so a
+revocation that then failed at the transport level would leave the row holding a rotated-away credential
+that can never be revoked. Worse, a link already latched as needing re-authorization would raise
+`ReauthorizationRequiredException` and turn "this link is broken" into "you may not remove it", which is
+backwards. Revocation reads what is stored, sends it, and reports.
+
+**Revocation is best-effort; the local delete is not.** The order is forced — after the delete there is
+no credential left to present, so the grant could never be revoked afterwards. The "delete anyway" is a
+judgement call, made explicit in the response: a provider outage must not be able to trap a user in a
+link they asked to remove, and continuing to hold a token this app was told to discard is the worse of
+the two failures. So the endpoint answers `200` with a body instead of `204`, because a no-content
+response can only say "done", and "done" is not always the whole story:
+
+```json
+{ "provider": "Google", "deleted": true, "revoked": false,
+  "revocationOutcome": "Unreachable", "detail": "provider_unreachable" }
+```
+
+`Revoked`, `AlreadyInvalid`, `NothingToRevoke`, `Unsupported`, `Unreachable` — five outcomes rather than
+a bool, because "the provider had nothing left to revoke" and "the provider could not be reached" are
+both *not revoked by us* and mean opposite things to a user. Only `Unreachable` leaves a live credential
+in someone else's hands, and it is the one worth telling the user about, along with the honest remedy:
+the provider's own settings page.
+
+#### Least privilege, made checkable
+
+A link starts with the scopes it cannot exist without — GitHub's `read:user` to put a name on the
+connection card, Google's `openid email profile` to get an `id_token` at all. Everything past that
+belongs to a widget and is asked for when that widget is switched on, via
+`/api/auth/{provider}/authorize?grant=<key>`. The alternative — front-loading every scope the dashboard
+might one day want into the first consent screen — is how users learn that a consent screen is a button
+you click past.
+
+**The request names a key, never a scope string, and that is the security property.** This is an
+authenticated endpoint that redirects the user's browser to a consent screen. `?scope=repo,admin:org`
+honoured verbatim would let anyone who can get this user to follow a link choose what the consent screen
+asks for — and the provider would cheerfully honour it — whereas `?grant=organizations` can only resolve
+to a scope this code already decided it wanted. An unrecognized key is a `400`, not a silent fallback to
+base scope: falling back would send the user through a consent screen, come back looking successful, and
+leave the widget still reporting that it needs a permission, with nothing anywhere saying why.
+
+**Incremental authorization works differently at each provider.** GitHub unions new scopes into the
+existing authorization, so a token minted now carries everything previously granted. Google does not:
+without `include_granted_scopes=true`, a token minted for this request carries *only* the scopes this
+request named, so adding the calendar widget would hand back a token that reads events and can no longer
+read the profile the connection card is drawn from. (Both re-send the base set for the same reason.)
+
+**Neither provider lets a grant be narrowed by re-authorizing** — GitHub never removes a scope from an
+authorization, Google keeps every scope the user has ever approved for the client. So the only way back
+down is revocation, which is why the two halves of this milestone are not a coincidence: *"ask for less
+later" is only a real option if "give it all back" exists.*
+
+**What is deliberately not on offer: GitHub's `repo`.** It is not a read-only upgrade — it is full read
+*and write* on every private repository the user can reach, with no narrower alternative available to an
+OAuth App. Asking for write access to everything in order to render a five-row list is the exact trade
+least privilege exists to refuse, so the repositories widget is public-only and the limitation is stated
+on the card rather than bought out with a scope. The request sends `visibility=public` anyway, even
+though `read:user` could not return a private repository: if this app ever holds a token with `repo` on
+it for some unrelated reason, the call must not quietly start putting private repository names on a card
+that says "public repositories". A request that only behaves correctly because of a scope it doesn't
+control is one scope change away from being wrong.
+
+On the Google side the same instinct picks `calendar.events.readonly` over the more familiar
+`calendar.readonly`: the widget reads events, and the narrower scope excludes the calendar metadata and
+sharing rules it has no business seeing. Each optional scope is stored next to a **purpose** sentence,
+because "we asked for calendar access" and "we asked for calendar access in order to list your next five
+events" are different requests to a user — and only one of them can be checked against what the code
+actually does.
+
+**The scope-delimiter trap is worth writing down.** RFC 6749 makes a scope *request* space-delimited and
+Google's responses follow suit, but GitHub answers with a **comma**-separated list
+(`"read:user,read:org"`). Splitting on space alone finds one scope named `read:user,read:org`, matches
+nothing, and the widget then reports that a permission the user actually granted is missing. Both
+separators are accepted; the comparison itself is **ordinal**, because scope strings are opaque
+identifiers and reporting a permission as granted on the strength of a near miss is the wrong direction
+to be loose in.
+
+**Google Calendar is a *resource* server, not the authorization server** — which is why it is a separate
+client with a hardcoded URL. OIDC Discovery describes identity endpoints and says nothing about APIs, so
+there was never going to be a `calendar_endpoint` in that document. Its `403` has two causes that must
+not be flattened together: `insufficientPermissions` means the token lacks the scope and re-consenting
+fixes it, while `accessNotConfigured` means the Calendar API is not enabled on this app's Google Cloud
+project — and telling a user to re-consent for that is worse than telling them nothing. GitHub's `403`
+needs the same care for a different reason: it spends that status on both a depleted rate limit and a
+missing scope, and only `x-ratelimit-remaining: 0` separates them.
+
+**What M5 does not buy.** Widget data isn't cached, so every dashboard load spends real provider
+requests — fine for one user, and the first thing a rate limit would force a change to. Revocation
+covers this app's own grant only; a token exfiltrated between the leak and the unlink already did
+whatever it did. And a `scope_required` card is an invitation, not enforcement: it reports what the
+*provider* said it granted, which is the only authority on the question — a provider that misreported its
+own grant string would be believed.
+
+### Verifying M5
+
+152 tests green (102 from M4, 50 new), across the fan-out, revocation and the scope allowlist. The ones
+that carry the milestone:
+
+- **Exactly one refresh POST for three GitHub widgets on an expired link.** The refresh endpoint is held
+  for 250 ms in the stub so the other two branches are genuinely queued on the gate rather than arriving
+  after the first one finished. Confirmed to bite by re-registering `RefreshLockRegistry` as scoped,
+  which makes it three POSTs — the assertion is worthless without knowing it can fail.
+- **One widget's failure costs one card.** Asserted for a provider outage, separately for a widget whose
+  *parsing* throws (the catch-all path), and for a widget that hangs past its timeout while the others
+  still render.
+- **Nothing is asked of a provider when the answer is already local**: nothing linked, a latched link, or
+  a scope never granted all produce zero outbound requests.
+- **A missing scope is distinguished from a depleted rate limit** — both GitHub `403` — and a dead grant
+  arrives with M3's own vocabulary rather than a new one.
+- **The reactive trigger through the fan-out**: a stored expiry that looks healthy, a provider answering
+  `401`, and a widget that still renders — which only works because the catalog holds a re-runnable fetch
+  delegate rather than a value.
+- **No token vocabulary in the serialized dashboard** — no `gho_`, `ghr_`, `ya29.` or `1//` material
+  anywhere in the response, and no `CfDJ8` either, since ciphertext is not an acceptable answer here
+  either. The same boundary test M2 established, now applied to the endpoint that actually carries
+  provider data.
+- **Revocation targets the grant, not a token**: GitHub's call goes to `/grant` authenticated with the
+  application's own credentials; Google's sends the **refresh** token, and falls back to the access token
+  only when there is no refresh token to send. A `400 invalid_token` is read as already-revoked while any
+  other `400` is not, and a provider outage reports `Unreachable` rather than claiming success.
+- **Revocation does not refresh first** even when the stored token expired an hour ago, and **is still
+  attempted for a link already latched as broken** — the two ways routing this through
+  `ProviderTokenService` would have gone wrong.
+- **The local row is deleted even when revocation could not be completed**, with the response saying so.
+- **The allowlist refuses everything that is not a registered key**: `repo`, `admin:org`, a smuggled
+  `read:org extra:thing`, a Gmail scope URL, the empty string — and keys don't leak across providers.
+  These negative cases are the whole test: a registry that hands out whatever it is asked for passes
+  every happy-path test there is, and the only thing wrong with it is where the request came from.
+- **Every optional scope on offer is read-only and carries a purpose sentence**, asserted rather than
+  assumed, because that is the kind of claim a README makes and a later commit quietly breaks.
+- **Google's authorize URL always sends `include_granted_scopes=true`**, and both providers' URLs carry
+  the base set plus exactly one grant.
+
+Not covered by tests, and worth stating: the repositories and organizations calls are exercised against
+the stub's shapes, not GitHub's real payloads — the field selection is verified by hand below.
+
+To walk it by hand, logged in locally with the SPA and API running:
+
+```
+GET    /api/dashboard                                   # every widget, one response
+GET    /api/auth/github/authorize?grant=organizations   # incremental consent → the organizations card fills in
+GET    /api/auth/github/authorize?grant=nonsense        # 400 unknown_grant
+POST   /api/dev/connections/GitHub/expire-access-token
+GET    /api/dashboard                                   # one GitHub card reports "refreshed": true, all three render
+POST   /api/dev/connections/GitHub/break-refresh-token
+GET    /api/dashboard                                   # GitHub cards: reauthorization_required / refresh_token_rejected
+                                                        # Google's cards unaffected — the isolation claim, visible
+DELETE /api/connections/GitHub                          # {"deleted":true,"revoked":true,"revocationOutcome":"Revoked"}
+```
+
+**The revocation evidence is at the provider, not in this app's response.** After the `DELETE`, GitHub's
+[authorized OAuth Apps](https://github.com/settings/applications) page no longer lists the app — and the
+sharper check is to re-link immediately: **the consent screen appears again**. Before M5 it would not
+have, because the authorization was still standing. For Google the equivalent is
+[permissions](https://myaccount.google.com/permissions), where the app's entry disappears.
+
+#### The Google Cloud console step the calendar widget needs
+
+The calendar widget is complete in code and **reports `permission_denied` with reason
+`accessNotConfigured` until two things are done in the Google Cloud project** — which is exactly the
+distinction `GoogleCalendarClient` draws, and the reason it draws it: no amount of re-consenting fixes
+this one.
+
+1. **Enable the Google Calendar API** for the project (APIs & Services → Library → Google Calendar API →
+   Enable). `accessNotConfigured` is the symptom of this step being missing.
+2. **Add `https://www.googleapis.com/auth/calendar.events.readonly`** to the OAuth consent screen's
+   scope list. Without it Google refuses the authorization request itself rather than the API call, so
+   the symptom is an `invalid_scope` error on the redirect instead of a `403` on the widget.
+
+Then `GET /api/auth/google/authorize?grant=calendar` shows a consent screen that names calendar access
+specifically — the observable for the whole least-privilege half of this milestone: the *first* Google
+link asked for identity only, and the calendar permission arrived on its own, later, when a widget needed
+it. This is a sensitive scope, so with the consent screen in Testing mode it works for the project's own
+test users and would need Google's verification to go further.
+
+Still to come: nothing in the milestone plan. What the code invites next is caching for the fan-out and a
+login built on the verified Google identity M4 produced — both separate decisions.
 
 ## Running locally
 
