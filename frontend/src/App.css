@@ -1,0 +1,284 @@
+.shell {
+  width: 100%;
+  max-width: 660px;
+  margin: 0 auto;
+  padding: 48px 24px;
+  box-sizing: border-box;
+  text-align: left;
+}
+
+.lede {
+  margin-bottom: 32px;
+}
+
+.panel {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 24px;
+  box-shadow: var(--shadow);
+}
+
+.status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 16px;
+  font-size: 20px;
+  color: var(--text-h);
+}
+
+.dot {
+  width: 10px;
+  height: 10px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--text);
+}
+
+.dot.ok {
+  background: #22c55e;
+}
+
+.dot.bad {
+  background: #ef4444;
+}
+
+.facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 8px 20px;
+  margin: 0 0 20px;
+}
+
+.facts dt {
+  color: var(--text);
+}
+
+.facts dd {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 15px;
+  color: var(--text-h);
+}
+
+.error {
+  margin-bottom: 12px;
+  font-family: var(--mono);
+  font-size: 15px;
+  color: #ef4444;
+}
+
+.hint {
+  margin-bottom: 20px;
+  font-size: 15px;
+}
+
+.action {
+  padding: 8px 16px;
+  font: inherit;
+  font-size: 16px;
+  color: var(--text-h);
+  cursor: pointer;
+  background: var(--accent-bg);
+  border: 1px solid var(--accent-border);
+  border-radius: 6px;
+}
+
+.action:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+/* A secondary action: same shape, no accent fill. Used for sign-out and unlink, which shouldn't
+   compete with the primary action on the page. */
+.action.subtle {
+  background: transparent;
+  border-color: var(--border);
+  color: var(--text);
+}
+
+.action.subtle:hover:not(:disabled) {
+  color: var(--text-h);
+  border-color: var(--accent-border);
+}
+
+/* --- App chrome ------------------------------------------------------------------------------ */
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--border);
+}
+
+.tabs {
+  display: flex;
+  gap: 4px;
+}
+
+.tabs a {
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-size: 16px;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.tabs a:hover {
+  color: var(--text-h);
+  background: var(--social-bg);
+}
+
+.tabs a.active {
+  color: var(--text-h);
+  background: var(--accent-bg);
+}
+
+.whoami {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.username {
+  font-family: var(--mono);
+  font-size: 15px;
+  color: var(--text-h);
+}
+
+/* --- Forms ----------------------------------------------------------------------------------- */
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  align-items: stretch;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.field > span {
+  font-size: 15px;
+  color: var(--text-h);
+}
+
+.field input {
+  padding: 10px 12px;
+  font: inherit;
+  font-size: 16px;
+  color: var(--text-h);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.field input:focus-visible {
+  outline: 2px solid var(--accent-border);
+  outline-offset: 1px;
+  border-color: var(--accent-border);
+}
+
+.field .hint {
+  margin: 0;
+}
+
+.form .error {
+  margin: 0;
+}
+
+.form .action {
+  align-self: flex-start;
+}
+
+/* --- Notices --------------------------------------------------------------------------------- */
+
+.notice {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 24px;
+  border-left: 3px solid var(--accent-border);
+}
+
+.notice.ok {
+  border-left-color: #22c55e;
+}
+
+.notice.bad {
+  border-left-color: #ef4444;
+}
+
+.notice .hint {
+  margin: 0;
+}
+
+/* --- Provider cards -------------------------------------------------------------------------- */
+
+.providers {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.provider-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.provider-head h2 {
+  margin: 0;
+}
+
+.badge {
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 14px;
+  color: var(--text);
+  background: var(--social-bg);
+  border: 1px solid var(--border);
+}
+
+.badge.ok {
+  color: #15803d;
+  background: rgba(34, 197, 94, 0.12);
+  border-color: rgba(34, 197, 94, 0.4);
+}
+
+@media (prefers-color-scheme: dark) {
+  .badge.ok {
+    color: #4ade80;
+  }
+}
+
+.provider .facts {
+  margin-bottom: 20px;
+}
+
+.footnote {
+  margin: 24px 0 0;
+}
+
+.row {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.status.check {
+  margin-bottom: 20px;
+  font-size: 16px;
+}

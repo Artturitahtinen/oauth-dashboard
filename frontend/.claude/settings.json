@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:docs.claude.com)",
+      "mcp__playwright__browser_fill_form",
+      "mcp__playwright__browser_evaluate",
+      "Bash(node -e ' *)",
+      "Bash(rm .playwright-mcp/logo-dataurl.txt)",
+      "mcp__playwright__browser_close",
+      "PowerShell($path = \"$env:APPDATA\\\\Microsoft\\\\UserSecrets\\\\ee447416-6879-41ff-b394-7b9c9e3da275\\\\secrets.json\"; if \\(Test-Path $path\\) { \\(Get-Content $path | ConvertFrom-Json\\).PSObject.Properties.Name } else { \"not found: $path\" })",
+      "mcp__playwright__browser_console_messages"
+    ]
+  }
+}
